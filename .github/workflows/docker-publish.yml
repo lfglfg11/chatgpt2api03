@@ -1,4 +1,5 @@
 name: Publish Docker Image
+# auto-build for newmain branch
 
 on:
   push:
