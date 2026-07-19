@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import imaplib
+import json
 import random
 import re
+import secrets
 import string
 import time
 from datetime import datetime, timezone
 from email import message_from_bytes, message_from_string, policy
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Any, Callable, TypeVar
 
 from curl_cffi import requests
@@ -293,6 +296,14 @@ gptmail_status_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 GPTMAIL_DEFAULT_API_BASE = "https://mail.chatgpt.org.uk"
 GPTMAIL_PUBLIC_STATUS_CACHE_SECONDS = 60
 GPTMAIL_CUSTOM_STATUS_CACHE_SECONDS = 30
+GPTMAIL2_DEFAULT_API_BASE = "https://mail.chatgpt.org.uk"
+GPTMAIL2_DOMAIN_REFRESH_SECONDS = 3 * 3600
+GPTMAIL2_FALLBACK_DOMAINS = ["2mail.eu.cc", "tempmail.com"]
+gptmail2_domains_lock = Lock()
+gptmail2_domains_cache: dict[str, dict[str, Any]] = {}
+gptmail2_refresh_stop = Event()
+gptmail2_refresh_thread: Thread | None = None
+gptmail2_refresh_thread_lock = Lock()
 
 
 def _config(mail_config: dict) -> dict:
@@ -1213,6 +1224,363 @@ class GptMailProvider(BaseMailProvider):
     def close(self) -> None:
         self.session.close()
 
+
+def _gptmail2_api_base(entry: dict | None = None) -> str:
+    entry = entry or {}
+    value = str(entry.get("api_base") or "").strip()
+    return (value or GPTMAIL2_DEFAULT_API_BASE).rstrip("/")
+
+
+def _gptmail2_common_headers(api_base: str, conf: dict, *, email: str = "", gm_sid: str = "", token: str = "") -> dict[str, str]:
+    headers = {
+        "User-Agent": str(conf.get("user_agent") or "Mozilla/5.0"),
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "Origin": api_base,
+        "Referer": f"{api_base}/zh/{email}" if email else f"{api_base}/zh/",
+    }
+    if gm_sid:
+        headers["Cookie"] = f"gm_sid={gm_sid}; gptmail_lang=zh"
+    if token:
+        headers["x-inbox-token"] = token
+    return headers
+
+
+def _gptmail2_generate_sid() -> str:
+    return secrets.token_hex(32)
+
+
+def _gptmail2_jwt_sid(token: str) -> str:
+    try:
+        parts = str(token or "").split(".")
+        if not parts:
+            return ""
+        payload_b64 = parts[1] if len(parts) >= 2 else parts[0]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))
+        if isinstance(payload, dict):
+            return str(payload.get("sid") or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _gptmail2_fetch_domains(api_base: str, conf: dict) -> list[str]:
+    session = _create_session(conf)
+    try:
+        resp = session.request(
+            "GET",
+            f"{api_base}/api/domains/public",
+            headers=_gptmail2_common_headers(api_base, conf),
+            timeout=conf["request_timeout"],
+            verify=False,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"GPTMail2 域名列表请求失败: HTTP {resp.status_code}, body={resp.text[:300]}")
+        body = resp.json()
+        if not isinstance(body, dict) or not body.get("success"):
+            raise RuntimeError(str((body or {}).get("error") or "GPTMail2 域名列表返回异常"))
+        data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        raw_domains = data.get("domains") if isinstance(data.get("domains"), list) else []
+        domains: list[str] = []
+        for item in raw_domains:
+            if not isinstance(item, dict):
+                continue
+            if item.get("is_active") not in (1, True, "1", "true", "True"):
+                continue
+            name = str(item.get("domain_name") or item.get("domain") or "").strip().lower()
+            if name and name not in domains:
+                domains.append(name)
+        if not domains:
+            raise RuntimeError("GPTMail2 未返回可用域名")
+        return domains
+    finally:
+        session.close()
+
+
+def _gptmail2_get_domains(api_base: str, conf: dict, *, force: bool = False) -> list[str]:
+    api_base = (api_base or GPTMAIL2_DEFAULT_API_BASE).rstrip("/")
+    now = time.time()
+    with gptmail2_domains_lock:
+        cached = gptmail2_domains_cache.get(api_base)
+        if (
+            not force
+            and cached
+            and isinstance(cached.get("domains"), list)
+            and cached["domains"]
+            and now - float(cached.get("fetched_at") or 0) < GPTMAIL2_DOMAIN_REFRESH_SECONDS
+        ):
+            return list(cached["domains"])
+
+    try:
+        domains = _gptmail2_fetch_domains(api_base, conf)
+        with gptmail2_domains_lock:
+            gptmail2_domains_cache[api_base] = {
+                "domains": list(domains),
+                "fetched_at": time.time(),
+                "error": "",
+            }
+        return list(domains)
+    except Exception as exc:
+        with gptmail2_domains_lock:
+            cached = gptmail2_domains_cache.get(api_base) or {}
+            stale = list(cached.get("domains") or [])
+            gptmail2_domains_cache[api_base] = {
+                "domains": stale,
+                "fetched_at": float(cached.get("fetched_at") or 0),
+                "error": str(exc),
+            }
+        if stale:
+            return stale
+        return list(GPTMAIL2_FALLBACK_DOMAINS)
+
+
+def gptmail2_domain_status(mail_config: dict | None = None, entry: dict | None = None) -> dict[str, Any]:
+    conf = _config(mail_config or {})
+    api_base = _gptmail2_api_base(entry)
+    with gptmail2_domains_lock:
+        cached = dict(gptmail2_domains_cache.get(api_base) or {})
+    domains = list(cached.get("domains") or [])
+    fetched_at = float(cached.get("fetched_at") or 0)
+    age = max(0, time.time() - fetched_at) if fetched_at else None
+    return {
+        "ok": bool(domains),
+        "api_base": api_base,
+        "domain_count": len(domains),
+        "fetched_at": datetime.fromtimestamp(fetched_at, tz=timezone.utc).isoformat() if fetched_at else "",
+        "age_seconds": int(age) if age is not None else None,
+        "refresh_seconds": GPTMAIL2_DOMAIN_REFRESH_SECONDS,
+        "error": str(cached.get("error") or ""),
+        "sample": domains[:5],
+    }
+
+
+def warm_gptmail2_domains(mail_config: dict | None = None, *, force: bool = False) -> list[dict[str, Any]]:
+    """拉取/刷新所有已启用 GPTMail2 的域名池，并确保后台 3 小时刷新线程已启动。"""
+    mail = mail_config if isinstance(mail_config, dict) else {}
+    conf = _config(mail)
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
+    for item in providers:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "") != "gptmail2":
+            continue
+        if item.get("enable") is False:
+            continue
+        api_base = _gptmail2_api_base(item)
+        if api_base in seen:
+            continue
+        seen.add(api_base)
+        domains = _gptmail2_get_domains(api_base, conf, force=force)
+        results.append({"api_base": api_base, "domain_count": len(domains)})
+    ensure_gptmail2_domain_refresher(mail)
+    return results
+
+
+def ensure_gptmail2_domain_refresher(mail_config: dict | None = None) -> None:
+    """启动后台线程：每 3 小时刷新已启用 GPTMail2 的域名列表。"""
+    global gptmail2_refresh_thread
+    mail = mail_config if isinstance(mail_config, dict) else {}
+    providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
+    enabled = [
+        item for item in providers
+        if isinstance(item, dict) and str(item.get("type") or "") == "gptmail2" and item.get("enable") is not False
+    ]
+    if not enabled:
+        return
+
+    def _loop() -> None:
+        while not gptmail2_refresh_stop.wait(GPTMAIL2_DOMAIN_REFRESH_SECONDS):
+            try:
+                try:
+                    from services.register import openai_register
+
+                    current = openai_register.config if isinstance(getattr(openai_register, "config", None), dict) else mail
+                except Exception:
+                    current = mail
+                current_mail = current.get("mail") if isinstance(current, dict) and isinstance(current.get("mail"), dict) else current
+                conf = _config(current_mail if isinstance(current_mail, dict) else {})
+                providers_now = []
+                if isinstance(current_mail, dict) and isinstance(current_mail.get("providers"), list):
+                    providers_now = current_mail.get("providers") or []
+                bases: set[str] = set()
+                for item in providers_now:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("type") or "") != "gptmail2":
+                        continue
+                    if item.get("enable") is False:
+                        continue
+                    bases.add(_gptmail2_api_base(item))
+                for api_base in bases:
+                    try:
+                        _gptmail2_get_domains(api_base, conf, force=True)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    with gptmail2_refresh_thread_lock:
+        if gptmail2_refresh_thread and gptmail2_refresh_thread.is_alive():
+            return
+        gptmail2_refresh_stop.clear()
+        gptmail2_refresh_thread = Thread(target=_loop, name="gptmail2-domain-refresh", daemon=True)
+        gptmail2_refresh_thread.start()
+
+
+class GptMail2Provider(BaseMailProvider):
+    """GPTMail 免密钥网页接口：随机域名池生成邮箱 + inbox-token 收信。"""
+
+    name = "gptmail2"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.entry = dict(entry or {})
+        self.api_base = _gptmail2_api_base(entry)
+        self.session = _create_session(conf)
+        ensure_gptmail2_domain_refresher({"providers": [self.entry]})
+
+    def _headers(self, *, email: str = "", gm_sid: str = "", token: str = "") -> dict[str, str]:
+        return _gptmail2_common_headers(self.api_base, self.conf, email=email, gm_sid=gm_sid, token=token)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        payload: dict | None = None,
+        email: str = "",
+        gm_sid: str = "",
+        token: str = "",
+    ) -> Any:
+        resp = self.session.request(
+            method.upper(),
+            f"{self.api_base}{path}",
+            params=params,
+            json=payload,
+            headers=self._headers(email=email, gm_sid=gm_sid, token=token),
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"GPTMail2 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise RuntimeError(f"GPTMail2 响应不是 JSON: {method} {path}") from exc
+        return data
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        domains = _gptmail2_get_domains(self.api_base, self.conf, force=False)
+        if not domains:
+            raise RuntimeError("GPTMail2 域名池为空")
+        domain = random.choice(domains)
+        prefix = (username or _random_mailbox_name()).strip().lower()
+        prefix = re.sub(r"[^a-z0-9._-]+", "", prefix) or _random_mailbox_name()
+        email = f"{prefix}@{domain}"
+        gm_sid = _gptmail2_generate_sid()
+        body = self._request(
+            "POST",
+            "/api/inbox-token",
+            payload={"email": email},
+            email=email,
+            gm_sid=gm_sid,
+        )
+        if not isinstance(body, dict) or not body.get("success"):
+            raise RuntimeError(str((body or {}).get("error") or "GPTMail2 获取 inbox-token 失败"))
+        auth = body.get("auth") if isinstance(body.get("auth"), dict) else {}
+        token = str(auth.get("token") or body.get("token") or "").strip()
+        if not token:
+            raise RuntimeError("GPTMail2 inbox-token 为空")
+        real_sid = _gptmail2_jwt_sid(token) or gm_sid
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": email,
+            "token": token,
+            "gm_sid": real_sid,
+            "api_base": self.api_base,
+            "label": str(self.entry.get("label") or self.name),
+        }
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        email = str(mailbox.get("address") or "").strip()
+        token = str(mailbox.get("token") or "").strip()
+        gm_sid = str(mailbox.get("gm_sid") or "").strip()
+        if not email or not token:
+            return None
+        body = self._request(
+            "GET",
+            "/api/emails",
+            params={"email": email},
+            email=email,
+            gm_sid=gm_sid,
+            token=token,
+        )
+        if not isinstance(body, dict):
+            return None
+        data = body.get("data") if isinstance(body.get("data"), dict) else body
+        emails = data.get("emails") if isinstance(data, dict) else None
+        if emails is None and isinstance(data, list):
+            emails = data
+        if not isinstance(emails, list) or not emails:
+            return None
+        item = max(
+            (value for value in emails if isinstance(value, dict)),
+            key=lambda value: (
+                float(value.get("timestamp") or 0),
+                str(value.get("created_at") or ""),
+                str(value.get("id") or ""),
+            ),
+            default=None,
+        )
+        if not item:
+            return None
+        message_id = str(item.get("id") or "").strip()
+        detail = item
+        if message_id and not (item.get("content") or item.get("html_content") or item.get("text_content")):
+            try:
+                detail_body = self._request(
+                    "GET",
+                    f"/api/email/{message_id}",
+                    email=email,
+                    gm_sid=gm_sid,
+                    token=token,
+                )
+                if isinstance(detail_body, dict):
+                    if isinstance(detail_body.get("data"), dict):
+                        detail = detail_body["data"]
+                    elif detail_body.get("id") or detail_body.get("content"):
+                        detail = detail_body
+            except Exception:
+                detail = item
+        text_content = str(
+            detail.get("content")
+            or detail.get("text_content")
+            or detail.get("text")
+            or item.get("content")
+            or ""
+        )
+        html_content = str(detail.get("html_content") or detail.get("html") or item.get("html_content") or "")
+        return {
+            "provider": self.name,
+            "mailbox": email,
+            "message_id": message_id,
+            "subject": str(detail.get("subject") or item.get("subject") or ""),
+            "sender": str(detail.get("from_address") or detail.get("from") or item.get("from_address") or ""),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(
+                detail.get("timestamp") or detail.get("created_at") or item.get("timestamp") or item.get("created_at")
+            ),
+            "raw": detail,
+        }
+
+    def close(self) -> None:
+        self.session.close()
 
 class DoneMailProvider(BaseMailProvider):
     name = "donemail"
@@ -2154,6 +2522,8 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return DuckMailProvider(entry, conf)
     if entry["type"] == "gptmail":
         return GptMailProvider(entry, conf)
+    if entry["type"] in {"gptmail2", "gpt_mail2", "gptmail_web"}:
+        return GptMail2Provider(entry, conf)
     if entry["type"] in {"donemail", "done_mail"}:
         return DoneMailProvider(entry, conf)
     if entry["type"] == "moemail":

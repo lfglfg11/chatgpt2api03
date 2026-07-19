@@ -62,6 +62,13 @@ def create_app() -> FastAPI:
         config.cleanup_old_images()
         cleanup_old_logs()
         try:
+            from services.register import mail_provider, openai_register
+            mail_cfg = openai_register.config.get("mail") if isinstance(getattr(openai_register, "config", None), dict) else {}
+            if isinstance(mail_cfg, dict):
+                mail_provider.warm_gptmail2_domains(mail_cfg, force=False)
+        except Exception as exc:
+            logger.warning({"event": "gptmail2_domain_warmup_failed", "error": str(exc)})
+        try:
             yield
         finally:
             stop_event.set()

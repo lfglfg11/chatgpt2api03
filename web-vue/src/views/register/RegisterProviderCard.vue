@@ -318,6 +318,9 @@
         </div>
         <p class="register-preview-line">{{ gptMail.statusHint(index, provider) }}</p>
       </div>
+    </div>    <div v-if="currentType === 'gptmail2'" class="register-provider-section register-provider-section--soft">
+      <div class="register-provider-section-title">GPTMail2</div>
+      <p class="register-preview-line">免密钥公共域名池：启用后启动时拉取域名，之后每 3 小时自动刷新；创建邮箱时随机轮询域名，无需填写域名。</p>
     </div>
 
     <div

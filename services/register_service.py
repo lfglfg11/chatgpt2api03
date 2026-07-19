@@ -251,6 +251,10 @@ class RegisterService:
             self._drop_mail_proxy()
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
             self._save()
+            try:
+                mail_provider.warm_gptmail2_domains(self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}, force=False)
+            except Exception:
+                pass
             return self.get()
 
     def start(self) -> dict:
@@ -270,6 +274,10 @@ class RegisterService:
             self._save()
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
+            try:
+                mail_provider.warm_gptmail2_domains(self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}, force=False)
+            except Exception:
+                pass
             self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
             return self.get()
 
