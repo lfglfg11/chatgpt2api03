@@ -1,5 +1,5 @@
-from services.image_output import resolve_image_response_format
 from __future__ import annotations
+from services.image_output import resolve_image_response_format
 
 import base64
 import binascii
