@@ -37,6 +37,48 @@
         </div>
       </FormSection>
 
+      <FormSection
+        title="图片输出格式"
+        subtitle="控制 /v1/images、/v1/chat/completions、/v1/responses 等接口在未指定 response_format 时的默认图片返回方式。"
+      >
+        <div class="settings-check-grid settings-check-grid--single">
+          <div class="settings-check-item">
+            <div class="settings-check-control">
+              <Checkbox
+                :model-value="urlOutputEnabled"
+                @update:model-value="setUrlOutputEnabled"
+              >
+                启用图片 URL 输出（默认 base64）
+              </Checkbox>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-3 grid gap-3 md:grid-cols-2">
+          <FormField label="图片访问域名" class="md:col-span-2">
+            <template #label-extra>
+              <HelpTip text="启用 URL 输出时必填。必须是公网可访问的 http(s) 域名，禁止填写裸 IP 或 localhost。例如 https://api.example.com" />
+            </template>
+            <Input
+              v-model.trim="settings.base_url"
+              block
+              root-class="font-mono"
+              placeholder="https://api.example.com"
+              :disabled="!urlOutputEnabled"
+            />
+            <p class="mt-2 text-xs leading-5 text-muted-foreground">
+              URL 模式下图片结果会返回链接而不是 base64。请求里仍可显式传 response_format 覆盖默认值。
+            </p>
+            <p v-if="urlOutputHint" class="mt-1 text-xs leading-5 text-amber-600">
+              {{ urlOutputHint }}
+            </p>
+            <p class="mt-1 font-mono text-xs text-muted-foreground">
+              示例：{{ exampleImageUrl }}
+            </p>
+          </FormField>
+        </div>
+      </FormSection>
+
       <FormSection title="常用接口">
         <div class="space-y-2">
           <details
@@ -64,7 +106,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Checkbox, FormField, FormSection, Input } from 'nanocat-ui'
+import { Checkbox, FormField, FormSection, HelpTip, Input } from 'nanocat-ui'
 import SurfaceBox from '@/components/ai/SurfaceBox.vue'
 import { getAuthToken } from '@/api/client'
 import type { Settings } from '@/types/api'
@@ -89,6 +131,60 @@ const apiDocItems = computed(() => (
     ? buildApiDocItems(serviceBaseUrl.value, currentApiKey.value)
     : []
 ))
+
+const urlOutputEnabled = computed(() => props.settings.image_generation?.output_format === 'url')
+
+function normalizeDomainInput(value: string): string {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  return text.includes('://') ? text.replace(/\/$/, '') : `https://${text}`.replace(/\/$/, '')
+}
+
+function isPublicDomainBaseUrl(value: string): boolean {
+  const text = normalizeDomainInput(value)
+  if (!text) return false
+  try {
+    const url = new URL(text)
+    if (!['http:', 'https:'].includes(url.protocol)) return false
+    const host = url.hostname.trim().toLowerCase()
+    if (!host || host === 'localhost') return false
+    if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host)) return false
+    if (host.includes(':')) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+const exampleImageUrl = computed(() => {
+  const base = normalizeDomainInput(props.settings.base_url || '') || 'https://api.example.com'
+  return `${base}/images/2026/07/21/example.png`
+})
+
+const urlOutputHint = computed(() => {
+  if (!urlOutputEnabled.value) return ''
+  const base = String(props.settings.base_url || '').trim()
+  if (!base) return '已启用 URL 输出：请填写图片访问域名后再保存。'
+  if (!isPublicDomainBaseUrl(base)) return '域名无效：请使用 http(s) 域名，禁止 IP 或 localhost。'
+  return ''
+})
+
+function setUrlOutputEnabled(value: boolean | 'indeterminate') {
+  const enabled = value === true
+  if (!props.settings.image_generation) {
+    props.settings.image_generation = {
+      enabled: true,
+      supported_models: [],
+      model_options: [],
+      block_rich_output_on_base_chat_models: true,
+      output_format: enabled ? 'url' : 'base64',
+      nanobanana_lane: 'fast',
+      nanobanana_lane_order: ['fast'],
+    }
+    return
+  }
+  props.settings.image_generation.output_format = enabled ? 'url' : 'base64'
+}
 </script>
 
 <style scoped>

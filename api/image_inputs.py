@@ -1,3 +1,4 @@
+from services.image_output import resolve_image_response_format
 from __future__ import annotations
 
 import base64
@@ -71,7 +72,7 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
         "n": _parse_count(fields.get("n")),
         "size": _clean(fields.get("size")) or None,
         "quality": _clean(fields.get("quality"), "auto"),
-        "response_format": _clean(fields.get("response_format"), "b64_json"),
+        "response_format": resolve_image_response_format(fields.get("response_format")),
         "stream": _parse_bool(fields.get("stream")),
     }
     if "client_task_id" in fields:

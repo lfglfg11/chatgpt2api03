@@ -39,6 +39,16 @@ DEFAULT_IMAGE_STORAGE = {
     "public_base_url": "",
 }
 
+DEFAULT_IMAGE_GENERATION = {
+    "enabled": True,
+    "supported_models": [],
+    "model_options": [],
+    "block_rich_output_on_base_chat_models": True,
+    "output_format": "base64",
+    "nanobanana_lane": "fast",
+    "nanobanana_lane_order": ["fast"],
+}
+
 DEFAULT_CHAT_COMPLETION_CACHE = {
     "enabled": True,
     "ttl_seconds": 60,
@@ -161,6 +171,60 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
         "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
     }
+
+
+
+def _normalize_image_generation_settings(value: object) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    lane = str(source.get("nanobanana_lane") or DEFAULT_IMAGE_GENERATION["nanobanana_lane"]).strip().lower() or "fast"
+    if lane not in {"fast", "thinking", "pro"}:
+        lane = "fast"
+    raw_order = source.get("nanobanana_lane_order")
+    lane_order: list[str] = []
+    if isinstance(raw_order, list):
+        for item in raw_order:
+            text_item = str(item or "").strip().lower()
+            if text_item in {"fast", "thinking", "pro"} and text_item not in lane_order:
+                lane_order.append(text_item)
+    if not lane_order:
+        lane_order = list(DEFAULT_IMAGE_GENERATION["nanobanana_lane_order"])
+    output_format = str(source.get("output_format") or DEFAULT_IMAGE_GENERATION["output_format"]).strip().lower()
+    if output_format in {"url", "image_url", "link"}:
+        output_format = "url"
+    else:
+        output_format = "base64"
+    supported = source.get("supported_models")
+    model_options = source.get("model_options")
+    return {
+        "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_IMAGE_GENERATION["enabled"])),
+        "supported_models": [str(item).strip() for item in supported if str(item).strip()] if isinstance(supported, list) else [],
+        "model_options": [str(item).strip() for item in model_options if str(item).strip()] if isinstance(model_options, list) else [],
+        "block_rich_output_on_base_chat_models": _normalize_bool(
+            source.get("block_rich_output_on_base_chat_models"),
+            bool(DEFAULT_IMAGE_GENERATION["block_rich_output_on_base_chat_models"]),
+        ),
+        "output_format": output_format,
+        "nanobanana_lane": lane,
+        "nanobanana_lane_order": lane_order,
+    }
+
+
+def _validate_image_url_output_settings(settings: dict[str, object]) -> None:
+    image_generation = settings.get("image_generation")
+    source = image_generation if isinstance(image_generation, dict) else {}
+    output_format = str(source.get("output_format") or "base64").strip().lower()
+    if output_format != "url":
+        return
+    base_url = str(settings.get("base_url") or "").strip()
+    from services.image_output import is_public_domain_base_url, normalize_public_base_url
+
+    normalized = normalize_public_base_url(base_url)
+    if not normalized:
+        raise ValueError("启用图片 URL 输出时，必须填写图片访问域名（base_url），且不能使用裸 IP")
+    if not is_public_domain_base_url(normalized):
+        raise ValueError("图片访问域名必须是 http(s) 域名，禁止使用 IP 地址或 localhost")
+    settings["base_url"] = normalized
+
 
 
 def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object]:
@@ -691,6 +755,18 @@ class ConfigStore:
             if "image_storage" in next_data:
                 next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
                 _validate_image_storage_settings(next_data["image_storage"])
+            if "image_generation" in next_data:
+                next_data["image_generation"] = _normalize_image_generation_settings(next_data.get("image_generation"))
+            # Validate URL output against base_url whenever either field is present.
+            if "image_generation" in next_data or "base_url" in next_data:
+                merged = dict(next_data)
+                if "image_generation" not in merged:
+                    merged["image_generation"] = _normalize_image_generation_settings(self.data.get("image_generation"))
+                if "base_url" not in merged:
+                    merged["base_url"] = str(self.data.get("base_url") or "").strip()
+                _validate_image_url_output_settings(merged)
+                if "base_url" in merged:
+                    next_data["base_url"] = str(merged.get("base_url") or "").strip()
             if "chat_completion_cache" in next_data:
                 next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
                     next_data.get("chat_completion_cache")
@@ -717,6 +793,9 @@ class ConfigStore:
 
     def get_image_storage_settings(self) -> dict[str, object]:
         return _normalize_image_storage_settings(self.data.get("image_storage"))
+    def get_image_generation_settings(self) -> dict[str, object]:
+        return _normalize_image_generation_settings(self.data.get("image_generation"))
+
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))

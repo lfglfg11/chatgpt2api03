@@ -130,7 +130,7 @@ image_generation:
   supported_models: []
   model_options: []
   block_rich_output_on_base_chat_models: true
-  output_format: url
+  output_format: base64  # base64 | url?url ????? base_url ?? IP ??
   nanobanana_lane: fast
   nanobanana_lane_order:
     - fast

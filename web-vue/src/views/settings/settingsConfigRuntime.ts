@@ -87,6 +87,37 @@ function accountCleanupDoneMessage(result: AccountCleanupResult): string {
   return `账号清理完成：移除 ${result.total_removed || 0} 个账号`
 }
 
+
+function isPublicDomainBaseUrl(value: unknown): boolean {
+  const raw = String(value || '').trim()
+  if (!raw) return false
+  const text = raw.includes('://') ? raw : `https://${raw}`
+  try {
+    const url = new URL(text)
+    if (!['http:', 'https:'].includes(url.protocol)) return false
+    const host = url.hostname.trim().toLowerCase()
+    if (!host || host === 'localhost') return false
+    if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host)) return false
+    if (host.includes(':')) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+function validateImageUrlOutputSettings(settings: Settings): string | null {
+  if (settings.image_generation?.output_format !== 'url') return null
+  const baseUrl = String(settings.base_url || '').trim()
+  if (!baseUrl) {
+    return '启用图片 URL 输出时，请在「接口接入」填写图片访问域名'
+  }
+  if (!isPublicDomainBaseUrl(baseUrl)) {
+    return '图片访问域名必须是 http(s) 域名，禁止使用 IP 或 localhost'
+  }
+  return null
+}
+
+
 export function useSettingsConfigRuntime(options: SettingsConfigRuntimeOptions) {
   const settingsStore = useSettingsStore()
   const { settings, isLoading: settingsLoading } = storeToRefs(settingsStore)
@@ -224,6 +255,17 @@ export function useSettingsConfigRuntime(options: SettingsConfigRuntimeOptions) 
 
   async function handleSave() {
     if (!localSettings.value) return
+    const validationError = validateImageUrlOutputSettings(localSettings.value)
+    if (validationError) {
+      toast.warning(validationError)
+      activeSettingsTab.value = 'api-docs'
+      return
+    }
+    // Normalize domain when URL output is enabled.
+    if (localSettings.value.image_generation?.output_format === 'url') {
+      const raw = String(localSettings.value.base_url || '').trim()
+      localSettings.value.base_url = raw.includes('://') ? raw.replace(/\/$/, '') : `https://${raw}`.replace(/\/$/, '')
+    }
     const confirmed = await confirmDialog.ask({
       title: '确认保存系统设置',
       message: '即将保存当前系统设置，可能影响接口地址、并发、存储和备份策略。是否继续？',

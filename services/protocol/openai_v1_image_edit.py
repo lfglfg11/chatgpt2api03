@@ -15,6 +15,7 @@ from services.protocol.conversation import (
     stream_image_chunks,
     stream_image_outputs_with_pool,
 )
+from services.image_output import resolve_image_output_base_url, resolve_image_response_format
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
 
 
@@ -58,8 +59,11 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     n = int(body.get("n") or 1)
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
-    response_format = str(body.get("response_format") or "b64_json")
-    base_url = str(body.get("base_url") or "") or None
+    response_format = resolve_image_response_format(body.get("response_format"))
+    base_url = resolve_image_output_base_url(
+        body.get("base_url"),
+        for_url_response=response_format == "url",
+    )
     progress_callback = body.get("progress_callback")
     encoded_images = encode_images(images)
     if not encoded_images:

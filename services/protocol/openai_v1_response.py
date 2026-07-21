@@ -7,6 +7,7 @@ from typing import Any, Iterable, Iterator
 from fastapi import HTTPException
 
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
+from services.image_output import resolve_image_output_base_url, resolve_image_response_format
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -213,14 +214,20 @@ def image_output_items(prompt: str, data: list[dict[str, Any]], item_id: str | N
     output = []
     for item in data:
         b64_json = str(item.get("b64_json") or "").strip()
-        if b64_json:
-            output.append({
-                "id": item_id or f"ig_{len(output) + 1}",
-                "type": "image_generation_call",
-                "status": "completed",
-                "result": b64_json,
-                "revised_prompt": str(item.get("revised_prompt") or prompt).strip() or prompt,
-            })
+        image_url = str(item.get("url") or item.get("image_url") or "").strip()
+        result = b64_json or image_url
+        if not result:
+            continue
+        payload = {
+            "id": item_id or f"ig_{len(output) + 1}",
+            "type": "image_generation_call",
+            "status": "completed",
+            "result": result,
+            "revised_prompt": str(item.get("revised_prompt") or prompt).strip() or prompt,
+        }
+        if image_url:
+            payload["url"] = image_url
+        output.append(payload)
     return output
 
 
@@ -474,12 +481,20 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         images = None
     input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), model)
     tool = response_image_tool(body)
+    response_format = resolve_image_response_format(
+        body.get("response_format") or tool.get("output_format") or tool.get("response_format")
+    )
+    base_url = resolve_image_output_base_url(
+        body.get("base_url"),
+        for_url_response=response_format == "url",
+    )
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         size=tool.get("size"),
         quality=str(tool.get("quality") or "auto"),
-        response_format="b64_json",
+        response_format=response_format,
+        base_url=base_url,
         images=images,
         message_as_error=True,
         call_id=str(body.get("_call_id") or ""),

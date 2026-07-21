@@ -47,7 +47,15 @@ def require_admin(authorization: str | None) -> dict[str, object]:
 
 
 def resolve_image_base_url(request: Request) -> str:
-    return config.base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
+    from services.image_output import resolve_image_output_base_url
+
+    host_fallback = f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
+    resolved = resolve_image_output_base_url(
+        None,
+        request_fallback=host_fallback,
+        for_url_response=None,
+    )
+    return resolved or host_fallback
 
 
 def sanitize_cpa_pool(pool: dict | None) -> dict | None:

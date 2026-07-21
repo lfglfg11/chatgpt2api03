@@ -269,7 +269,7 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
       supported_models: Array.isArray(source.image_generation?.supported_models) ? source.image_generation.supported_models : [],
       model_options: Array.isArray(source.image_generation?.model_options) ? source.image_generation.model_options : [],
       block_rich_output_on_base_chat_models: boolValue(source.image_generation?.block_rich_output_on_base_chat_models, true),
-      output_format: source.image_generation?.output_format === 'base64' ? 'base64' : 'url',
+      output_format: source.image_generation?.output_format === 'url' ? 'url' : 'base64',
       nanobanana_lane: source.image_generation?.nanobanana_lane || 'fast',
       nanobanana_lane_order: Array.isArray(source.image_generation?.nanobanana_lane_order)
         ? source.image_generation.nanobanana_lane_order
