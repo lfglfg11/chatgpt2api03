@@ -65,7 +65,10 @@ def create_app() -> FastAPI:
             from services.register import mail_provider, openai_register
             mail_cfg = openai_register.config.get("mail") if isinstance(getattr(openai_register, "config", None), dict) else {}
             if isinstance(mail_cfg, dict):
-                mail_provider.warm_gptmail2_domains(mail_cfg, force=False)
+                warmup_config = dict(mail_cfg)
+                if warmup_config.get("api_use_register_proxy") is not False:
+                    warmup_config["proxy"] = str(openai_register.config.get("proxy") or "").strip()
+                mail_provider.warm_gptmail2_domains(warmup_config, force=False)
         except Exception as exc:
             logger.warning({"event": "gptmail2_domain_warmup_failed", "error": str(exc)})
         try:

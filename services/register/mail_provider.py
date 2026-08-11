@@ -4,10 +4,14 @@ import base64
 import hashlib
 import imaplib
 import json
+import os
 import random
 import re
 import secrets
+import shutil
 import string
+import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from email import message_from_bytes, message_from_string, policy
@@ -15,6 +19,7 @@ from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
 from threading import Event, Lock, Thread
 from typing import Any, Callable, TypeVar
+from urllib.parse import unquote, urlparse
 
 from curl_cffi import requests
 
@@ -299,8 +304,12 @@ GPTMAIL_CUSTOM_STATUS_CACHE_SECONDS = 30
 GPTMAIL2_DEFAULT_API_BASE = "https://mail.chatgpt.org.uk"
 GPTMAIL2_DOMAIN_REFRESH_SECONDS = 3 * 3600
 GPTMAIL2_FALLBACK_DOMAINS = ["2mail.eu.cc", "tempmail.com"]
+GPTMAIL2_SESSION_MIN_TTL_SECONDS = 60 * 60
+GPTMAIL2_SESSION_FILE = DATA_DIR / "gptmail2_session.json"
 gptmail2_domains_lock = Lock()
 gptmail2_domains_cache: dict[str, dict[str, Any]] = {}
+gptmail2_session_lock = Lock()
+gptmail2_sessions: dict[str, dict[str, str]] = {}
 gptmail2_refresh_stop = Event()
 gptmail2_refresh_thread: Thread | None = None
 gptmail2_refresh_thread_lock = Lock()
@@ -1231,16 +1240,208 @@ def _gptmail2_api_base(entry: dict | None = None) -> str:
     return (value or GPTMAIL2_DEFAULT_API_BASE).rstrip("/")
 
 
-def _gptmail2_common_headers(api_base: str, conf: dict, *, email: str = "", gm_sid: str = "", token: str = "") -> dict[str, str]:
+def _gptmail2_token_expiry(token: str) -> float:
+    """Return the expiry embedded in GPTMail's signed browser cookie, if present."""
+    for part in str(token or "").split(".")[:2]:
+        try:
+            padded = part + "=" * (-len(part) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+            value = float(payload.get("exp")) if isinstance(payload, dict) else 0.0
+            if value > 0:
+                return value
+        except Exception:
+            continue
+    return 0.0
+
+
+def _gptmail2_session_valid(session: dict[str, Any] | None, api_base: str) -> bool:
+    if not isinstance(session, dict):
+        return False
+    token = str(session.get("v") or "").strip()
+    saved_base = str(session.get("api_base") or "").strip().rstrip("/")
+    return bool(
+        token
+        and saved_base == api_base.rstrip("/")
+        and _gptmail2_token_expiry(token) > time.time() + GPTMAIL2_SESSION_MIN_TTL_SECONDS
+    )
+
+
+def _gptmail2_load_browser_session(api_base: str) -> dict[str, str] | None:
+    cached = gptmail2_sessions.get(api_base)
+    if _gptmail2_session_valid(cached, api_base):
+        return dict(cached)
+    saved = read_json_file(
+        GPTMAIL2_SESSION_FILE,
+        name="gptmail2_session.json",
+        default_factory=dict,
+        expected_types=dict,
+    )
+    if not _gptmail2_session_valid(saved, api_base):
+        return None
+    session = {
+        "v": str(saved.get("v") or ""),
+        "sid": str(saved.get("sid") or ""),
+        "user_agent": str(saved.get("user_agent") or ""),
+        "api_base": api_base,
+    }
+    gptmail2_sessions[api_base] = dict(session)
+    return session
+
+
+def _gptmail2_camoufox_proxy(proxy_value: str) -> dict[str, str] | None:
+    value = str(proxy_value or "").strip()
+    if not value:
+        return None
+    parsed = urlparse(value if "://" in value else f"http://{value}")
+    if not parsed.hostname:
+        raise RuntimeError("GPTMail2 浏览器验证的代理地址无效")
+    result = {"server": f"{parsed.scheme or 'http'}://{parsed.hostname}"}
+    if parsed.port:
+        result["server"] += f":{parsed.port}"
+    if parsed.username:
+        result["username"] = unquote(parsed.username)
+    if parsed.password:
+        result["password"] = unquote(parsed.password)
+    return result
+
+
+def _gptmail2_browser_headless(entry: dict | None = None) -> bool:
+    value = (entry or {}).get("browser_headless")
+    if value is None:
+        value = os.getenv("GPTMAIL2_BROWSER_HEADLESS", "false")
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _gptmail2_save_browser_session(api_base: str, session: dict[str, Any]) -> dict[str, str]:
+    normalized = {
+        "v": str(session.get("v") or ""),
+        "sid": str(session.get("sid") or ""),
+        "user_agent": str(session.get("user_agent") or ""),
+        "api_base": api_base,
+    }
+    if not _gptmail2_session_valid(normalized, api_base):
+        raise RuntimeError("GPTMail2 返回的浏览器验证 Cookie 无效或即将过期")
+    write_json_file(GPTMAIL2_SESSION_FILE, normalized)
+    try:
+        os.chmod(GPTMAIL2_SESSION_FILE, 0o600)
+    except OSError:
+        pass
+    gptmail2_sessions[api_base] = dict(normalized)
+    return normalized
+
+
+def _gptmail2_refresh_browser_session_in_xvfb(api_base: str, conf: dict) -> dict[str, str]:
+    """Run the short Camoufox verification in an isolated virtual display, then exit."""
+    xvfb_run = shutil.which("xvfb-run")
+    if not xvfb_run:
+        raise RuntimeError("GPTMail2 需要 xvfb-run；请安装 xvfb 后重试")
+    command = [
+        xvfb_run,
+        "-a",
+        "-s",
+        "-screen 0 1440x900x24",
+        sys.executable,
+        "-m",
+        "services.register.gptmail2_browser_session",
+        "--api-base",
+        api_base,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            input=json.dumps({"proxy": str(conf.get("proxy") or "")}),
+            text=True,
+            capture_output=True,
+            timeout=max(90, int(float(conf.get("request_timeout") or 30)) + 75),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("GPTMail2 浏览器验证超时") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip().replace("\n", " ")[:500]
+        raise RuntimeError(f"GPTMail2 浏览器验证失败: {detail or f'退出码 {completed.returncode}'}")
+    try:
+        payload = json.loads(completed.stdout)
+    except Exception as exc:
+        raise RuntimeError("GPTMail2 浏览器验证未返回有效会话") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("GPTMail2 浏览器验证返回格式错误")
+    return _gptmail2_save_browser_session(api_base, payload)
+
+
+def _gptmail2_refresh_browser_session(api_base: str, conf: dict, entry: dict | None = None) -> dict[str, str]:
+    """Open GPTMail in Camoufox and persist its short-lived browser-verification cookie."""
+    headless = _gptmail2_browser_headless(entry)
+    if sys.platform.startswith("linux") and not headless and not os.environ.get("DISPLAY"):
+        return _gptmail2_refresh_browser_session_in_xvfb(api_base, conf)
+    try:
+        from camoufox.sync_api import Camoufox
+    except ImportError as exc:
+        raise RuntimeError("GPTMail2 需要安装 camoufox；请重新构建/安装运行环境") from exc
+
+    options: dict[str, Any] = {"headless": headless}
+    proxy = _gptmail2_camoufox_proxy(str(conf.get("proxy") or ""))
+    if proxy:
+        options["proxy"] = proxy
+
+    hostname = (urlparse(api_base).hostname or "").lower()
+    timeout_ms = max(10_000, int(float(conf.get("request_timeout") or 30) * 1000))
+    with Camoufox(**options) as browser:
+        page = browser.new_page()
+        page.goto(f"{api_base}/zh/", wait_until="domcontentloaded", timeout=max(timeout_ms, 60_000))
+        for _ in range(60):
+            cookies = [
+                cookie
+                for cookie in page.context.cookies()
+                if not hostname or hostname in str(cookie.get("domain") or "").lower()
+            ]
+            verified = next((cookie for cookie in cookies if cookie.get("name") == "gm_browser_verified"), None)
+            if verified and str(verified.get("value") or "").strip():
+                session = {
+                    "v": str(verified["value"]),
+                    "sid": str(next((cookie.get("value") for cookie in cookies if cookie.get("name") == "gm_sid"), "") or ""),
+                    "user_agent": str(page.evaluate("() => navigator.userAgent") or ""),
+                }
+                return _gptmail2_save_browser_session(api_base, session)
+            time.sleep(1)
+    raise RuntimeError("GPTMail2 在 60 秒内未完成浏览器验证；请检查代理或浏览器运行环境")
+
+
+def _gptmail2_browser_session(api_base: str, conf: dict, entry: dict | None = None, *, force: bool = False) -> dict[str, str]:
+    with gptmail2_session_lock:
+        if not force:
+            session = _gptmail2_load_browser_session(api_base)
+            if session:
+                return session
+        return _gptmail2_refresh_browser_session(api_base, conf, entry)
+
+
+def _gptmail2_common_headers(
+    api_base: str,
+    conf: dict,
+    *,
+    browser_session: dict[str, str],
+    email: str = "",
+    gm_sid: str = "",
+    token: str = "",
+) -> dict[str, str]:
+    browser_sid = str(browser_session.get("sid") or "").strip()
+    verified = str(browser_session.get("v") or "").strip()
+    if not verified:
+        raise RuntimeError("GPTMail2 浏览器验证 Cookie 为空")
     headers = {
-        "User-Agent": str(conf.get("user_agent") or "Mozilla/5.0"),
+        "User-Agent": str(browser_session.get("user_agent") or conf.get("user_agent") or "Mozilla/5.0"),
         "Accept": "*/*",
         "Content-Type": "application/json",
         "Origin": api_base,
         "Referer": f"{api_base}/zh/{email}" if email else f"{api_base}/zh/",
     }
-    if gm_sid:
-        headers["Cookie"] = f"gm_sid={gm_sid}; gptmail_lang=zh"
+    cookie_parts = ["gptmail_lang=zh", f"gm_browser_verified={verified}"]
+    if browser_sid or gm_sid:
+        cookie_parts.append(f"gm_sid={browser_sid or gm_sid}")
+    headers["Cookie"] = "; ".join(cookie_parts)
     if token:
         headers["x-inbox-token"] = token
     return headers
@@ -1265,19 +1466,40 @@ def _gptmail2_jwt_sid(token: str) -> str:
     return ""
 
 
-def _gptmail2_fetch_domains(api_base: str, conf: dict) -> list[str]:
+def _gptmail2_needs_browser_verification(status_code: int, body: Any) -> bool:
+    if status_code not in {200, 401, 403}:
+        return False
+    try:
+        text = json.dumps(body, ensure_ascii=False).lower()
+    except Exception:
+        text = str(body or "").lower()
+    return "browser_verification" in text or "browser verification" in text or "gm_browser_verified" in text
+
+
+def _gptmail2_fetch_domains(api_base: str, conf: dict, entry: dict | None = None) -> list[str]:
     session = _create_session(conf)
     try:
-        resp = session.request(
-            "GET",
-            f"{api_base}/api/domains/public",
-            headers=_gptmail2_common_headers(api_base, conf),
-            timeout=conf["request_timeout"],
-            verify=False,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"GPTMail2 域名列表请求失败: HTTP {resp.status_code}, body={resp.text[:300]}")
-        body = resp.json()
+        body: Any = None
+        resp = None
+        for attempt in range(2):
+            browser_session = _gptmail2_browser_session(api_base, conf, entry, force=attempt > 0)
+            resp = session.request(
+                "GET",
+                f"{api_base}/api/domains/public",
+                headers=_gptmail2_common_headers(api_base, conf, browser_session=browser_session),
+                timeout=conf["request_timeout"],
+                verify=False,
+            )
+            try:
+                body = resp.json()
+            except Exception:
+                body = resp.text[:300]
+            if attempt == 0 and _gptmail2_needs_browser_verification(resp.status_code, body):
+                continue
+            break
+        if resp is None or resp.status_code != 200:
+            status = resp.status_code if resp is not None else "unknown"
+            raise RuntimeError(f"GPTMail2 域名列表请求失败: HTTP {status}, body={str(body)[:300]}")
         if not isinstance(body, dict) or not body.get("success"):
             raise RuntimeError(str((body or {}).get("error") or "GPTMail2 域名列表返回异常"))
         data = body.get("data") if isinstance(body.get("data"), dict) else {}
@@ -1298,7 +1520,7 @@ def _gptmail2_fetch_domains(api_base: str, conf: dict) -> list[str]:
         session.close()
 
 
-def _gptmail2_get_domains(api_base: str, conf: dict, *, force: bool = False) -> list[str]:
+def _gptmail2_get_domains(api_base: str, conf: dict, entry: dict | None = None, *, force: bool = False) -> list[str]:
     api_base = (api_base or GPTMAIL2_DEFAULT_API_BASE).rstrip("/")
     now = time.time()
     with gptmail2_domains_lock:
@@ -1313,7 +1535,7 @@ def _gptmail2_get_domains(api_base: str, conf: dict, *, force: bool = False) -> 
             return list(cached["domains"])
 
     try:
-        domains = _gptmail2_fetch_domains(api_base, conf)
+        domains = _gptmail2_fetch_domains(api_base, conf, entry)
         with gptmail2_domains_lock:
             gptmail2_domains_cache[api_base] = {
                 "domains": list(domains),
@@ -1373,14 +1595,14 @@ def warm_gptmail2_domains(mail_config: dict | None = None, *, force: bool = Fals
         if api_base in seen:
             continue
         seen.add(api_base)
-        domains = _gptmail2_get_domains(api_base, conf, force=force)
+        domains = _gptmail2_get_domains(api_base, conf, item, force=force)
         results.append({"api_base": api_base, "domain_count": len(domains)})
     ensure_gptmail2_domain_refresher(mail)
     return results
 
 
 def ensure_gptmail2_domain_refresher(mail_config: dict | None = None) -> None:
-    """启动后台线程：每 3 小时刷新已启用 GPTMail2 的域名列表。"""
+    """Keep enabled GPTMail2 domains fresh and renew browser verification one hour early."""
     global gptmail2_refresh_thread
     mail = mail_config if isinstance(mail_config, dict) else {}
     providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
@@ -1392,7 +1614,10 @@ def ensure_gptmail2_domain_refresher(mail_config: dict | None = None) -> None:
         return
 
     def _loop() -> None:
-        while not gptmail2_refresh_stop.wait(GPTMAIL2_DOMAIN_REFRESH_SECONDS):
+        next_domain_refresh = 0.0
+        wait_seconds = 0.0
+        while not gptmail2_refresh_stop.wait(wait_seconds):
+            wait_seconds = float(GPTMAIL2_DOMAIN_REFRESH_SECONDS)
             try:
                 try:
                     from services.register import openai_register
@@ -1401,26 +1626,42 @@ def ensure_gptmail2_domain_refresher(mail_config: dict | None = None) -> None:
                 except Exception:
                     current = mail
                 current_mail = current.get("mail") if isinstance(current, dict) and isinstance(current.get("mail"), dict) else current
-                conf = _config(current_mail if isinstance(current_mail, dict) else {})
-                providers_now = []
-                if isinstance(current_mail, dict) and isinstance(current_mail.get("providers"), list):
-                    providers_now = current_mail.get("providers") or []
-                bases: set[str] = set()
+                current_mail = dict(current_mail) if isinstance(current_mail, dict) else {}
+                if current_mail.get("api_use_register_proxy") is not False:
+                    current_mail["proxy"] = str((current or {}).get("proxy") or current_mail.get("proxy") or "").strip()
+                conf = _config(current_mail)
+                providers_now = current_mail.get("providers") if isinstance(current_mail.get("providers"), list) else []
+                active_by_base: dict[str, dict] = {}
                 for item in providers_now:
-                    if not isinstance(item, dict):
-                        continue
-                    if str(item.get("type") or "") != "gptmail2":
-                        continue
-                    if item.get("enable") is False:
-                        continue
-                    bases.add(_gptmail2_api_base(item))
-                for api_base in bases:
-                    try:
-                        _gptmail2_get_domains(api_base, conf, force=True)
-                    except Exception:
-                        continue
+                    if isinstance(item, dict) and str(item.get("type") or "") == "gptmail2" and item.get("enable") is not False:
+                        active_by_base.setdefault(_gptmail2_api_base(item), item)
+
+                now = time.time()
+                for api_base, item in active_by_base.items():
+                    session = _gptmail2_load_browser_session(api_base)
+                    expires_at = _gptmail2_token_expiry(str((session or {}).get("v") or ""))
+                    if expires_at <= now + GPTMAIL2_SESSION_MIN_TTL_SECONDS:
+                        try:
+                            session = _gptmail2_browser_session(api_base, conf, item, force=True)
+                            expires_at = _gptmail2_token_expiry(str(session.get("v") or ""))
+                        except Exception:
+                            wait_seconds = min(wait_seconds, 5 * 60.0)
+                            continue
+                    wait_seconds = min(
+                        wait_seconds,
+                        max(60.0, expires_at - time.time() - GPTMAIL2_SESSION_MIN_TTL_SECONDS),
+                    )
+
+                if time.monotonic() >= next_domain_refresh:
+                    for api_base, item in active_by_base.items():
+                        try:
+                            _gptmail2_get_domains(api_base, conf, item, force=True)
+                        except Exception:
+                            continue
+                    next_domain_refresh = time.monotonic() + GPTMAIL2_DOMAIN_REFRESH_SECONDS
+                wait_seconds = min(wait_seconds, max(60.0, next_domain_refresh - time.monotonic()))
             except Exception:
-                continue
+                wait_seconds = min(wait_seconds, 5 * 60.0)
 
     with gptmail2_refresh_thread_lock:
         if gptmail2_refresh_thread and gptmail2_refresh_thread.is_alive():
@@ -1440,10 +1681,24 @@ class GptMail2Provider(BaseMailProvider):
         self.entry = dict(entry or {})
         self.api_base = _gptmail2_api_base(entry)
         self.session = _create_session(conf)
-        ensure_gptmail2_domain_refresher({"providers": [self.entry]})
+        ensure_gptmail2_domain_refresher({"providers": [self.entry], "proxy": str(conf.get("proxy") or "")})
 
-    def _headers(self, *, email: str = "", gm_sid: str = "", token: str = "") -> dict[str, str]:
-        return _gptmail2_common_headers(self.api_base, self.conf, email=email, gm_sid=gm_sid, token=token)
+    def _headers(
+        self,
+        *,
+        browser_session: dict[str, str],
+        email: str = "",
+        gm_sid: str = "",
+        token: str = "",
+    ) -> dict[str, str]:
+        return _gptmail2_common_headers(
+            self.api_base,
+            self.conf,
+            browser_session=browser_session,
+            email=email,
+            gm_sid=gm_sid,
+            token=token,
+        )
 
     def _request(
         self,
@@ -1456,25 +1711,40 @@ class GptMail2Provider(BaseMailProvider):
         gm_sid: str = "",
         token: str = "",
     ) -> Any:
-        resp = self.session.request(
-            method.upper(),
-            f"{self.api_base}{path}",
-            params=params,
-            json=payload,
-            headers=self._headers(email=email, gm_sid=gm_sid, token=token),
-            timeout=self.conf["request_timeout"],
-            verify=False,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"GPTMail2 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
-        try:
-            data = resp.json()
-        except Exception as exc:
-            raise RuntimeError(f"GPTMail2 响应不是 JSON: {method} {path}") from exc
-        return data
+        response_body: Any = None
+        resp = None
+        for attempt in range(2):
+            browser_session = _gptmail2_browser_session(self.api_base, self.conf, self.entry, force=attempt > 0)
+            resp = self.session.request(
+                method.upper(),
+                f"{self.api_base}{path}",
+                params=params,
+                json=payload,
+                headers=self._headers(
+                    browser_session=browser_session,
+                    email=email,
+                    gm_sid=gm_sid,
+                    token=token,
+                ),
+                timeout=self.conf["request_timeout"],
+                verify=False,
+            )
+            try:
+                response_body = resp.json()
+            except Exception:
+                response_body = resp.text[:300]
+            if attempt == 0 and _gptmail2_needs_browser_verification(resp.status_code, response_body):
+                continue
+            break
+        if resp is None or resp.status_code != 200:
+            status = resp.status_code if resp is not None else "unknown"
+            raise RuntimeError(f"GPTMail2 请求失败: {method} {path}, HTTP {status}, body={str(response_body)[:300]}")
+        if not isinstance(response_body, (dict, list)):
+            raise RuntimeError(f"GPTMail2 响应不是 JSON: {method} {path}")
+        return response_body
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        domains = _gptmail2_get_domains(self.api_base, self.conf, force=False)
+        domains = _gptmail2_get_domains(self.api_base, self.conf, self.entry, force=False)
         if not domains:
             raise RuntimeError("GPTMail2 域名池为空")
         domain = random.choice(domains)

@@ -43,12 +43,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     openssl \
     tzdata \
+    xvfb \
+    libgtk-3-0 \
+    libdbus-1-3 \
+    libx11-xcb1 \
+    libxcb-shm0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libxkbcommon0 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    libatspi2.0-0 \
+    libnss3 \
+    libnspr4 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
+# GPTMail2 only starts Camoufox for a short browser-verification refresh.  Keep
+# the browser binary in the image so runtime refreshes do not download assets.
+RUN uv run --no-sync python -m camoufox fetch
 
 COPY main.py ./
 COPY config.example.yaml ./
