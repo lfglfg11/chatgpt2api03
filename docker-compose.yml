@@ -2,6 +2,7 @@ services:
   app:
     image: ${CHATGPT2API_IMAGE:-ghcr.io/yukkcat/chatgpt2api:latest}
     container_name: chatgpt2api
+    init: true
     restart: unless-stopped
     ports:
       - "${CHATGPT2API_PORT:-3000}:80"
