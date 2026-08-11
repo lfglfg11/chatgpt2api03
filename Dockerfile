@@ -44,6 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl \
     tzdata \
     xvfb \
+    xauth \
     libgtk-3-0 \
     libdbus-1-3 \
     libx11-xcb1 \
