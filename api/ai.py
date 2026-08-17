@@ -228,7 +228,7 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "kind must be ppt or psd"})
         endpoint = f"/v1/{kind}/generations"
         await filter_or_log(
-            LoggedCall(identity, endpoint, "gpt-5-5-thinking", f"{kind.upper()} generation task", request_text=body.prompt),
+            LoggedCall(identity, endpoint, "gpt-5-6-thinking", f"{kind.upper()} generation task", request_text=body.prompt),
             body.prompt,
         )
         submit = editable_file_task_service.submit_psd if kind == "psd" else editable_file_task_service.submit_ppt
@@ -252,7 +252,7 @@ def create_router() -> APIRouter:
     @router.post("/v1/ppt/generations")
     async def create_ppt_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
-        await filter_or_log(LoggedCall(identity, "/v1/ppt/generations", "gpt-5-5-thinking", "PPT生成任务", request_text=body.prompt), body.prompt)
+        await filter_or_log(LoggedCall(identity, "/v1/ppt/generations", "gpt-5-6-thinking", "PPT生成任务", request_text=body.prompt), body.prompt)
         return await run_in_threadpool(
             editable_file_task_service.submit_ppt,
             identity,
@@ -265,7 +265,7 @@ def create_router() -> APIRouter:
     @router.post("/v1/psd/generations")
     async def create_psd_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
-        await filter_or_log(LoggedCall(identity, "/v1/psd/generations", "gpt-5-5-thinking", "PSD生成任务", request_text=body.prompt), body.prompt)
+        await filter_or_log(LoggedCall(identity, "/v1/psd/generations", "gpt-5-6-thinking", "PSD生成任务", request_text=body.prompt), body.prompt)
         return await run_in_threadpool(
             editable_file_task_service.submit_psd,
             identity,

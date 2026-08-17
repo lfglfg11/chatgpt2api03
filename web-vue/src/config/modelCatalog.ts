@@ -8,6 +8,7 @@ export const FALLBACK_CHAT_MODELS = [
   'gpt-5-3',
   'gpt-5-3-mini',
   'gpt-5-5',
+  'gpt-5-6',
   'gpt-5-mini',
 ]
 
