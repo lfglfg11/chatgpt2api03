@@ -35,6 +35,7 @@ INTERNAL_RESPONSE_KEYS = {
     "_call_id",
     "_image_urls",
     "_image_attempts",
+    "_image_metadata",
 }
 
 

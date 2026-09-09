@@ -5,7 +5,7 @@ from typing import Any
 from services.account_service import account_service
 from services.model_catalog_service import get_model_catalog
 from services.openai_backend_api import OpenAIBackendAPI
-from utils.helper import CODEX_IMAGE_MODEL
+from utils.helper import CODEX_IMAGE_MODEL, WEB_IMAGE_MODELS
 
 
 def _model_item(model: str) -> dict[str, Any]:
@@ -69,7 +69,7 @@ def _dynamic_image_models() -> list[str]:
     }
 
     if web_image_accounts:
-        models.append("gpt-image-2")
+        models.extend(WEB_IMAGE_MODELS)
     if codex_types & {"Plus", "Team", "Pro"}:
         models.append(CODEX_IMAGE_MODEL)
     for plan_type in ("Plus", "Team", "Pro"):

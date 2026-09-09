@@ -197,6 +197,8 @@ export type SystemLogRow = {
   imageFailedCount: number
   imageResultStatus: string
   accountSwitchCount: number
+  requestedSize: string
+  resolution: string
   diagnosisChips: LogDiagnosisChip[]
   preview: string
   rawJson: string
@@ -512,6 +514,17 @@ export function normalizeSystemLogRow(item: SystemLog, index: number, options: N
           : ''
   )
   const accountSwitchCount = imageAccountSwitchCount(imageAttempts)
+  const resultImages = Array.isArray(detailRawValue(detail, 'result_images'))
+    ? detailRawValue(detail, 'result_images') as Array<Record<string, unknown>>
+    : []
+  const resolution = resultImages
+    .map((image) => (
+      normalizeNonNegativeNumber(image?.width) > 0 && normalizeNonNegativeNumber(image?.height) > 0
+        ? `${normalizeNonNegativeNumber(image?.width)}×${normalizeNonNegativeNumber(image?.height)}`
+        : '未知'
+    ))
+    .join(' / ')
+  const requestedSize = cleanString(requestMeta.size)
   const status = detailValue(detail, 'status')
   const durationMs = detailValue(detail, 'duration_ms')
   const statusCode = detailValue(detail, 'status_code')
@@ -581,6 +594,8 @@ export function normalizeSystemLogRow(item: SystemLog, index: number, options: N
     imageFailedCount,
     imageResultStatus,
     accountSwitchCount,
+    requestedSize,
+    resolution,
     diagnosisChips: buildSystemLogDiagnosisChips({
       status,
       durationMs,

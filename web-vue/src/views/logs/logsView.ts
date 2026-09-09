@@ -403,6 +403,7 @@ export function systemLogRowSignature(item: SystemLogRow, input: SystemLogRowSig
     item.imageUrls.length,
     item.imageAttempts.length,
     item.accountSwitchCount,
+    boundedSignatureText(item.resolution, 64),
     item.imageUrls.slice(0, 4).map((url) => boundedSignatureText(url, 96)).join(','),
     boundedSignatureText(item.preview),
     isFailed(item) ? 1 : 0,
