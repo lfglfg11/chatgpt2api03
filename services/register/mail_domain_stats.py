@@ -23,7 +23,9 @@ from services.config import DATA_DIR
 from utils.log import logger
 
 STATE_PATH = DATA_DIR / "register_domain_stats.json"
-DEFAULT_FAILURE_THRESHOLD = 3
+# unsupported_email 是 OpenAI 对域名的确定性拒绝信号，且本项目主要消费 GPTMail2
+# 免费轮换域名池（域名可弃、冷却后自动半开重试），首次拒绝即拉黑是最优策略。
+DEFAULT_FAILURE_THRESHOLD = 1
 DEFAULT_BLOCK_COOLDOWN_HOURS = 6.0
 _DOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 _UNSUPPORTED_MARKERS = ("unsupported_email", "the email you provided is not supported")

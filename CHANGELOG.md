@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-+ [新增] 注册邮箱域名信誉库与自动拉黑：`unsupported_email` 连续拒绝达到阈值（默认 3 次）自动拉黑该域名，冷却期（默认 6 小时）后半开重试；选择域名时剔除已拉黑项，池耗尽 fail-open 不阻塞注册。
++ [新增] 注册邮箱域名信誉库与自动拉黑：`unsupported_email` 首次拒绝即拉黑该域名（确定性信号，阈值可用 `CHATGPT2API_MAIL_DOMAIN_FAILURE_THRESHOLD` 调整），冷却期（默认 6 小时，`CHATGPT2API_MAIL_DOMAIN_BLOCK_COOLDOWN_HOURS`）后半开重试；选择域名时剔除已拉黑项，池耗尽 fail-open 不阻塞注册。
 + [新增] 注册任务遇域名拒绝自动换邮箱重试（每任务最多 2 次重试），不再因单个坏域名直接失败；注册成功清零该域名拒绝计数，形成自愈闭环。
 + [新增] 管理接口 `GET /api/register/mail-domains`（域名信誉快照）与 `POST /api/register/mail-domains/reset`（解除指定域名拉黑）。
 + [同步] 移植上游 v3.2.3（d58db04）image-2.5 兼容与分辨率日志，二开功能（图片 URL 输出、图片放大、GPTMail2、GPT-5.6、CI）全部保留。
