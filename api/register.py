@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from api.support import require_admin
+from services.register import mail_domain_stats
 from services.register_service import register_service
 
 
@@ -29,6 +30,10 @@ class OutlookPoolResetRequest(BaseModel):
 class GptMailStatusRequest(BaseModel):
     provider: dict | None = None
     force: bool | None = None
+
+
+class MailDomainResetRequest(BaseModel):
+    domain: str
 
 
 def create_router() -> APIRouter:
@@ -79,6 +84,19 @@ def create_router() -> APIRouter:
             return {"status": register_service.refresh_gptmail_public_key(body.provider, force=body.force is not False)}
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get("/api/register/mail-domains")
+    async def get_mail_domain_stats(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return mail_domain_stats.stats_snapshot()
+
+    @router.post("/api/register/mail-domains/reset")
+    async def reset_mail_domain(body: MailDomainResetRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        result = mail_domain_stats.reset_domain(body.domain)
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=str(result.get("error") or "域名解除失败"))
+        return result
 
     @router.get("/api/register/events")
     async def register_events(token: str = ""):

@@ -27,6 +27,7 @@ from curl_cffi import requests
 from services.config import DATA_DIR
 from services.json_file import read_json_file, write_json_file
 from services.proxy_service import proxy_settings
+from services.register import mail_domain_stats
 
 DDG_ALIASES_FILE = DATA_DIR / "ddg_aliases.json"
 _ddg_aliases_lock = Lock()
@@ -1747,6 +1748,7 @@ class GptMail2Provider(BaseMailProvider):
         domains = _gptmail2_get_domains(self.api_base, self.conf, self.entry, force=False)
         if not domains:
             raise RuntimeError("GPTMail2 域名池为空")
+        domains = mail_domain_stats.filter_domains(self.name, domains)
         domain = random.choice(domains)
         prefix = (username or _random_mailbox_name()).strip().lower()
         prefix = re.sub(r"[^a-z0-9._-]+", "", prefix) or _random_mailbox_name()
@@ -2841,13 +2843,24 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> None:
     """注册流程结束后更新邮箱池状态。
 
-    仅对 outlook_token 邮箱生效：成功标记 used；失败时若是 token 失效标记 token_invalid，
-    登录态问题标记 login_required，其余失败标记 failed（可重试但不会自动再次领用）。
+    所有邮箱来源都会回报域名信誉（mail_domain_stats）：成功清零拒绝计数，
+    unsupported_email 触发拒绝计数并按阈值自动拉黑；其余失败为 neutral，
+    不影响域名统计。
+
+    仅对 outlook_token 邮箱生效池内状态：成功标记 used；失败时若是 token
+    失效标记 token_invalid，登录态问题标记 login_required，其余失败标记
+    failed（可重试但不会自动再次领用）。
     """
-    if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
-        return
+    provider_name = str(mailbox.get("provider") or "")
     address = str(mailbox.get("address") or "").strip()
-    if not address:
+    if address:
+        if success:
+            mail_domain_stats.record_domain_result(provider_name, address, "accepted")
+        elif mail_domain_stats.is_domain_rejected_error(error):
+            mail_domain_stats.record_domain_result(provider_name, address, "rejected", error)
+        else:
+            mail_domain_stats.record_domain_result(provider_name, address, "neutral")
+    if provider_name != OutlookTokenProvider.name:
         return
     if success:
         _set_outlook_token_state(address, "used")

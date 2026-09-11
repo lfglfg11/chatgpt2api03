@@ -19,8 +19,15 @@ from curl_cffi import requests
 from services.account_service import account_service
 from services.json_file import read_json_object
 from services.proxy_service import ClearanceBundle, proxy_settings
-from services.register import mail_provider
+from services.register import mail_domain_stats, mail_provider
 from utils.timezone import TIME_FORMAT, beijing_now_str
+
+# 每个注册任务在邮箱域名被 OpenAI 拒绝（unsupported_email）时，允许换邮箱重试的次数。
+MAIL_DOMAIN_RETRY_LIMIT = 2
+
+
+class EmailDomainRejectedError(RuntimeError):
+    """OpenAI 明确拒绝当前邮箱域名（unsupported_email），换域名重试可恢复。"""
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -870,7 +877,10 @@ class PlatformRegistrar:
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             debug = _response_debug_detail(resp)
             status = getattr(resp, "status_code", "unknown")
-            raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
+            message = error or f"platform_authorize_http_{status}{detail}, {debug}"
+            if mail_domain_stats.is_domain_rejected_error(json.dumps(_response_json(resp), ensure_ascii=False)):
+                raise EmailDomainRejectedError(message)
+            raise RuntimeError(message)
         landed = _authorize_landed_page(resp)
         final_url = str(getattr(resp, "url", "") or "")
         self.passwordless_signup = "/email-verification" in final_url.lower()
@@ -1022,7 +1032,10 @@ class PlatformRegistrar:
         if resp is None or resp.status_code not in (200, 201, 204):
             data = _response_json(resp) if resp is not None else {}
             detail = f", detail={json.dumps(data, ensure_ascii=False)[:300]}" if data else ""
-            raise RuntimeError(error or f"passwordless_send_otp_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
+            message = f"passwordless_send_otp_http_{getattr(resp, 'status_code', 'unknown')}{detail}"
+            if mail_domain_stats.is_domain_rejected_error(json.dumps(data, ensure_ascii=False)):
+                raise EmailDomainRejectedError(message)
+            raise RuntimeError(error or message)
         self.passwordless_signup = True
         step(index, "passwordless signup 验证码发送完成")
 
@@ -1170,7 +1183,10 @@ class PlatformRegistrar:
             if data.get("message") == "Failed to create account. Please try again.":
                 step(index, "创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
-            raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
+            message = error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}"
+            if mail_domain_stats.is_domain_rejected_error(json.dumps(data, ensure_ascii=False)):
+                raise EmailDomainRejectedError(message)
+            raise RuntimeError(message)
         data = _response_json(resp)
         callback_params = (
             extract_oauth_callback_params_from_url(str(data.get("continue_url") or "").strip())
@@ -1241,28 +1257,37 @@ class PlatformRegistrar:
 
 def worker(index: int) -> dict:
     start = time.time()
-    registrar = PlatformRegistrar(config["proxy"])
-    try:
-        step(index, "任务启动")
-        result = registrar.register(index)
-        cost = time.time() - start
-        access_token = str(result["access_token"])
-        account_service.add_account_items([result])
-        refresh_result = account_service.refresh_accounts([access_token])
-        if refresh_result.get("errors"):
-            step(index, f"账号已保存，刷新状态暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
-        with stats_lock:
-            stats["done"] += 1
-            stats["success"] += 1
-            avg = (time.time() - stats["start_time"]) / stats["success"]
-        log(f'{result["email"]} 注册成功，本次耗时{cost:.1f}s，全局平均每个号注册耗时{avg:.1f}s', "green")
-        return {"ok": True, "index": index, "result": result}
-    except Exception as e:
-        cost = time.time() - start
-        with stats_lock:
-            stats["done"] += 1
-            stats["fail"] += 1
-        log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
-        return {"ok": False, "index": index, "error": str(e)}
-    finally:
-        registrar.close()
+    last_error: Exception | None = None
+    for attempt in range(1 + MAIL_DOMAIN_RETRY_LIMIT):
+        registrar = PlatformRegistrar(config["proxy"])
+        try:
+            if attempt:
+                step(index, f"邮箱域名被 OpenAI 拒绝，更换邮箱重试（{attempt}/{MAIL_DOMAIN_RETRY_LIMIT}）", "yellow")
+            step(index, "任务启动")
+            result = registrar.register(index)
+            cost = time.time() - start
+            access_token = str(result["access_token"])
+            account_service.add_account_items([result])
+            refresh_result = account_service.refresh_accounts([access_token])
+            if refresh_result.get("errors"):
+                step(index, f"账号已保存，刷新状态暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
+            with stats_lock:
+                stats["done"] += 1
+                stats["success"] += 1
+                avg = (time.time() - stats["start_time"]) / stats["success"]
+            log(f'{result["email"]} 注册成功，本次耗时{cost:.1f}s，全局平均每个号注册耗时{avg:.1f}s', "green")
+            return {"ok": True, "index": index, "result": result}
+        except EmailDomainRejectedError as e:
+            last_error = e
+            continue
+        except Exception as e:
+            last_error = e
+            break
+        finally:
+            registrar.close()
+    cost = time.time() - start
+    with stats_lock:
+        stats["done"] += 1
+        stats["fail"] += 1
+    log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {last_error}", "red")
+    return {"ok": False, "index": index, "error": str(last_error)}
