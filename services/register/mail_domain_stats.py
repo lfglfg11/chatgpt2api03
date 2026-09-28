@@ -265,6 +265,24 @@ def _proven(item: dict[str, Any] | None) -> bool:
     return bool(item) and int(item.get("code_received_count") or 0) > 0
 
 
+def _should_silent_block(item: dict[str, Any]) -> bool:
+    """是否应把该域名按"静默丢信"拉黑。
+
+    - 从未送达过验证码是前提（送达过的域名不会被静默拉黑）；
+    - 连续丢信达到阈值即拉黑；
+    - 历史累计丢信已达阈值时，冷却结束后的第一次丢信立即重新拉黑：坏域名池
+      （实测约 75% 的免费域名）每 24 小时回来一次、每次都要烧掉 80 秒等待，
+      没必要重新取证两次。
+    """
+    if int(item.get("code_received_count") or 0) > 0:
+        return False
+    threshold = _silent_threshold()
+    return (
+        int(item.get("consecutive_no_code") or 0) >= threshold
+        or int(item.get("no_code_count") or 0) >= threshold
+    )
+
+
 def filter_domains(provider: str, domains: list[str]) -> list[str]:
     """返回剔除已拉黑域名后的可用列表；全部被拉黑时 fail-open 返回原列表。"""
     normalized: list[str] = []
@@ -404,11 +422,7 @@ def record_domain_result(provider: str, email_or_domain: object, outcome: str, e
             item["consecutive_no_code"] = int(item.get("consecutive_no_code") or 0) + 1
             item["last_no_code_at"] = _now_iso()
             item["last_error"] = str(error or "")[:200] or "verification code not delivered"
-            if (
-                item["consecutive_no_code"] >= _silent_threshold()
-                and int(item.get("code_received_count") or 0) == 0
-                and not item.get("silent_blocked_at")
-            ):
+            if not item.get("silent_blocked_at") and _should_silent_block(item):
                 item["silent_blocked_at"] = _now_iso()
                 newly_silent_blocked = True
         elif action == "throttled":
