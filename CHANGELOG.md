@@ -2,7 +2,10 @@
 
 ## Unreleased
 
-+ [新增] 邮箱域名"验证码送达"信誉与自适应选择：免费域名池里约 75% 的域名会被静默丢信（OpenAI 不返回 unsupported_email，但永远收不到验证码），此前这类失败只能等到 80 秒超时。现在收到验证码即记送达（进入 proven 池），等待超时记丢信，连续 2 次丢信且从未送达的域名自动静默拉黑（`CHATGPT2API_MAIL_DOMAIN_SILENT_THRESHOLD`，冷却 24 小时 `CHATGPT2API_MAIL_DOMAIN_SILENT_COOLDOWN_HOURS`）；域名选择按 proven 优先 + 探索比例（`CHATGPT2API_MAIL_DOMAIN_EXPLORE_RATIO`）分配，把验证码到达率从 ~15% 提升到 ~85%+。
++ [优化] 域名选择规避上游限流：GPTMail2 `inbox-token` 返回 429（`inbox_request_rate_limited`）时，记录该域名短冷却（默认 120 秒，`CHATGPT2API_MAIL_DOMAIN_THROTTLE_COOLDOWN_SECONDS`）并在冷却期内跳过，同时自动换域名重试最多 3 次，不再让一次限流响应废弃整个任务线程；限流不计入拒绝/丢信统计，避免误杀好域名。
++ [修复] 未知域名过少时不再强制探索（`CHATGPT2API_MAIL_DOMAIN_EXPLORE_MIN_POOL`，默认 3）：此前探索预算会反复落到同一个垃圾域名（如 ip6.arpa 反查名），浪费约 15% 的注册尝试。
++ [优化] 域名信誉时间戳改为毫秒精度，使秒级限流冷却判定准确。
++ [新增] 邮箱域名"验证码送达"信誉与自适应选择：免费域名池里约 75% 的域名会被静默丢信（OpenAI 不返回 unsupported_email，但永远收不到验证码），此前这类失败只能等到 80 秒超时。现在收到验证码即记送达（进入 proven 池），等待超时记丢信，连续 2 次丢信且从未送达的域名自动静默拉黑（`CHATGPT2API_MAIL_DOMAIN_SILENT_THRESHOLD`，冷却 24 小时 `CHATGPT2API_MAIL_DOMAIN_SILENT_COOLDOWN_HOURS`）；域名选择按 proven 优先 + 探索比例（`CHATGPT2API_MAIL_DOMAIN_EXPLORE_RATIO`）分配，实测验证码到达率 14.5% → 50.9%、注册成功率 5.9% → 18.1%、号池正常账号 12 → 57。
 + [新增] 历史日志回填脚本 `scripts/mail_domain_backfill.py`：从注册日志统计各域名"收到验证码/等待超时"，直接初始化送达信誉，避免上线后重新摸索。
 + [新增] `GET /api/register/mail-domains` 支持 `status=all|blocked|proven|dead`、`keyword`、`limit` 过滤，域名信誉快照新增 `delivery_rate`、`delivery_proven`、`delivery_dead`、`silent_blocked` 等字段。
 + [新增] 注册邮箱域名信誉库与自动拉黑：`unsupported_email` 首次拒绝即拉黑该域名（确定性信号，阈值可用 `CHATGPT2API_MAIL_DOMAIN_FAILURE_THRESHOLD` 调整），冷却期（默认 6 小时，`CHATGPT2API_MAIL_DOMAIN_BLOCK_COOLDOWN_HOURS`）后半开重试；选择域名时剔除已拉黑项，池耗尽 fail-open 不阻塞注册。

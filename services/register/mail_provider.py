@@ -1748,37 +1748,55 @@ class GptMail2Provider(BaseMailProvider):
         domains = _gptmail2_get_domains(self.api_base, self.conf, self.entry, force=False)
         if not domains:
             raise RuntimeError("GPTMail2 域名池为空")
-        # 优先复用历史上真正收到过验证码的域名：免费池里大部分域名会被静默丢信。
-        domain = mail_domain_stats.select_domain(self.name, domains)
-        if not domain:
-            raise RuntimeError("GPTMail2 域名池为空")
         prefix = (username or _random_mailbox_name()).strip().lower()
         prefix = re.sub(r"[^a-z0-9._-]+", "", prefix) or _random_mailbox_name()
-        email = f"{prefix}@{domain}"
-        gm_sid = _gptmail2_generate_sid()
-        body = self._request(
-            "POST",
-            "/api/inbox-token",
-            payload={"email": email},
-            email=email,
-            gm_sid=gm_sid,
-        )
-        if not isinstance(body, dict) or not body.get("success"):
-            raise RuntimeError(str((body or {}).get("error") or "GPTMail2 获取 inbox-token 失败"))
-        auth = body.get("auth") if isinstance(body.get("auth"), dict) else {}
-        token = str(auth.get("token") or body.get("token") or "").strip()
-        if not token:
-            raise RuntimeError("GPTMail2 inbox-token 为空")
-        real_sid = _gptmail2_jwt_sid(token) or gm_sid
-        return {
-            "provider": self.name,
-            "provider_ref": self.provider_ref,
-            "address": email,
-            "token": token,
-            "gm_sid": real_sid,
-            "api_base": self.api_base,
-            "label": str(self.entry.get("label") or self.name),
-        }
+        last_error: Exception | None = None
+        for attempt in range(3):
+            # 优先复用历史上真正收到过验证码的域名：免费池里大部分域名会被静默丢信。
+            domain = mail_domain_stats.select_domain(self.name, domains)
+            if not domain:
+                raise RuntimeError("GPTMail2 域名池为空")
+            email = f"{prefix}@{domain}"
+            gm_sid = _gptmail2_generate_sid()
+            try:
+                body = self._request(
+                    "POST",
+                    "/api/inbox-token",
+                    payload={"email": email},
+                    email=email,
+                    gm_sid=gm_sid,
+                )
+            except RuntimeError as error:
+                # 上游对域名/接口限流：记一次短冷却换域名重试，不要浪费整个任务线程。
+                if mail_domain_stats.is_domain_throttled_error(error) and attempt < 2:
+                    mail_domain_stats.record_domain_result(self.name, email, "throttled", error)
+                    last_error = error
+                    time.sleep(0.6 * (attempt + 1))
+                    continue
+                raise
+            if not isinstance(body, dict) or not body.get("success"):
+                detail = str((body or {}).get("error") or "GPTMail2 获取 inbox-token 失败")
+                if mail_domain_stats.is_domain_throttled_error(detail) and attempt < 2:
+                    mail_domain_stats.record_domain_result(self.name, email, "throttled", detail)
+                    last_error = RuntimeError(detail)
+                    time.sleep(0.6 * (attempt + 1))
+                    continue
+                raise RuntimeError(detail)
+            auth = body.get("auth") if isinstance(body.get("auth"), dict) else {}
+            token = str(auth.get("token") or body.get("token") or "").strip()
+            if not token:
+                raise RuntimeError("GPTMail2 inbox-token 为空")
+            real_sid = _gptmail2_jwt_sid(token) or gm_sid
+            return {
+                "provider": self.name,
+                "provider_ref": self.provider_ref,
+                "address": email,
+                "token": token,
+                "gm_sid": real_sid,
+                "api_base": self.api_base,
+                "label": str(self.entry.get("label") or self.name),
+            }
+        raise last_error or RuntimeError("GPTMail2 获取 inbox-token 失败")
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
         email = str(mailbox.get("address") or "").strip()
