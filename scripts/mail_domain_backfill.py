@@ -7,9 +7,14 @@ unsupported_email，只是永远收不到验证码）。这类失败只体现在
 
 用法（项目根目录）：
     PYTHONPATH=. python3 scripts/mail_domain_backfill.py --log /tmp/register.log
+    PYTHONPATH=. python3 scripts/mail_domain_backfill.py --log /tmp/register.log --accounts /tmp/account_emails.txt
     PYTHONPATH=. python3 scripts/mail_domain_backfill.py --log /tmp/register.log --dry-run
 
+⚠️ 必须在应用停止（或用一次性容器）时执行：应用进程每次回报域名结果都是
+"读文件 → 改 → 整文件写回"，与外部写入并发时会用旧副本覆盖回填结果。
+
 日志来源：`docker logs <容器> --since 24h 2>&1 | grep -E '任务[0-9]+' > /tmp/register.log`
+账号列表来源：`GET /api/accounts` 的 items[].email（每行一个）。
 
 回填规则（只增不减，幂等）：
 - 收到验证码的任务 -> 对应域名 code_received_count 取观测值与现有值的较大者；
@@ -73,9 +78,23 @@ def scan(log_path: Path) -> tuple[dict[str, int], dict[str, int], int, int]:
     return dict(delivered), dict(missing), ok_tasks, miss_tasks
 
 
+def scan_accounts(accounts_path: Path) -> dict[str, int]:
+    """统计账号池邮箱域名：能注册成功说明该域名确实送达过验证码。"""
+    counts: dict[str, int] = defaultdict(int)
+    for raw in accounts_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        text = raw.strip().strip('",')
+        if not text:
+            continue
+        domain = mds.normalize_domain(text)
+        if domain:
+            counts[domain] += 1
+    return dict(counts)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="回填邮箱域名验证码送达信誉")
     parser.add_argument("--log", required=True, help="注册日志文件路径")
+    parser.add_argument("--accounts", default="", help="账号邮箱列表文件（每行一个邮箱或域名），用于把已知能收信域名标为 proven")
     parser.add_argument("--dry-run", action="store_true", help="只打印，不写状态文件")
     parser.add_argument("--state", default="", help="覆盖信誉库路径（默认 data/register_domain_stats.json）")
     args = parser.parse_args()
@@ -89,6 +108,16 @@ def main() -> int:
 
     delivered, missing, ok_tasks, miss_tasks = scan(log_path)
     print(f"日志扫描完成：送达任务 {ok_tasks} 个，丢信任务 {miss_tasks} 个，涉及域名 {len(set(delivered) | set(missing))} 个")
+
+    if args.accounts:
+        accounts_path = Path(args.accounts)
+        if not accounts_path.is_file():
+            print(f"账号列表不存在: {accounts_path}", file=sys.stderr)
+            return 2
+        account_domains = scan_accounts(accounts_path)
+        print(f"账号池覆盖 {len(account_domains)} 个域名（这些域名一定成功送达过验证码）")
+        for domain, count in account_domains.items():
+            delivered[domain] = max(delivered.get(domain, 0), count)
 
     with mds._lock:
         items = mds._load_unlocked()
