@@ -2,6 +2,9 @@
 
 ## Unreleased
 
++ [新增] 邮箱域名"验证码送达"信誉与自适应选择：免费域名池里约 75% 的域名会被静默丢信（OpenAI 不返回 unsupported_email，但永远收不到验证码），此前这类失败只能等到 80 秒超时。现在收到验证码即记送达（进入 proven 池），等待超时记丢信，连续 2 次丢信且从未送达的域名自动静默拉黑（`CHATGPT2API_MAIL_DOMAIN_SILENT_THRESHOLD`，冷却 24 小时 `CHATGPT2API_MAIL_DOMAIN_SILENT_COOLDOWN_HOURS`）；域名选择按 proven 优先 + 探索比例（`CHATGPT2API_MAIL_DOMAIN_EXPLORE_RATIO`）分配，把验证码到达率从 ~15% 提升到 ~85%+。
++ [新增] 历史日志回填脚本 `scripts/mail_domain_backfill.py`：从注册日志统计各域名"收到验证码/等待超时"，直接初始化送达信誉，避免上线后重新摸索。
++ [新增] `GET /api/register/mail-domains` 支持 `status=all|blocked|proven|dead`、`keyword`、`limit` 过滤，域名信誉快照新增 `delivery_rate`、`delivery_proven`、`delivery_dead`、`silent_blocked` 等字段。
 + [新增] 注册邮箱域名信誉库与自动拉黑：`unsupported_email` 首次拒绝即拉黑该域名（确定性信号，阈值可用 `CHATGPT2API_MAIL_DOMAIN_FAILURE_THRESHOLD` 调整），冷却期（默认 6 小时，`CHATGPT2API_MAIL_DOMAIN_BLOCK_COOLDOWN_HOURS`）后半开重试；选择域名时剔除已拉黑项，池耗尽 fail-open 不阻塞注册。
 + [新增] 注册任务遇域名拒绝自动换邮箱重试（每任务最多 2 次重试），不再因单个坏域名直接失败；注册成功清零该域名拒绝计数，形成自愈闭环。
 + [新增] 管理接口 `GET /api/register/mail-domains`（域名信誉快照）与 `POST /api/register/mail-domains/reset`（解除指定域名拉黑）。

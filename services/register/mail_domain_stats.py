@@ -1,17 +1,24 @@
-"""邮箱域名信誉库：按域名记录注册成败，连续被 OpenAI 拒绝的域名自动拉黑。
+"""邮箱域名信誉库：按域名记录注册成败，自动拉黑被拒绝/收不到验证码的域名。
 
 设计参考 grok-register-panel 的 webui/email_domain_store.py，并适配本项目
 GPTMail2 动态域名池的特点：
+
 - 选择域名时过滤已拉黑域名（冷却到期自动半开重试），池耗尽时 fail-open；
 - 注册任务成功/失败通过 mark_mailbox_result 回报结果，形成闭环；
-- unsupported_email（"The email you provided is not supported."）是唯一
-  触发拒绝计数的确定性信号，模糊报错不计数，避免误杀好域名。
+- unsupported_email（"The email you provided is not supported."）是确定性拒绝
+  信号，首次出现即拉黑；
+- 验证码收不到（OTP 超时）是 OpenAI/GPTMail2 对域名静默丢信的弱信号：实测
+  1410 个免费域名里约 1061 个从未送达（0% 到达率），另 185 个稳定送达，
+  因此对静默丢信采用"连续 N 次无信且从未收到过验证码"才拉黑，冷却期更长；
+- 有送达记录的域名进入 proven 池，选择时按比例优先复用（explore ratio 用于
+  持续发现新的可用域名），把选择命中率从 ~15% 提升到 ~90% 量级。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -27,29 +34,62 @@ STATE_PATH = DATA_DIR / "register_domain_stats.json"
 # 免费轮换域名池（域名可弃、冷却后自动半开重试），首次拒绝即拉黑是最优策略。
 DEFAULT_FAILURE_THRESHOLD = 1
 DEFAULT_BLOCK_COOLDOWN_HOURS = 6.0
+# 静默丢信（OTP 超时）是弱信号，需要连续多次确认才拉黑。
+DEFAULT_SILENT_FAILURE_THRESHOLD = 2
+DEFAULT_SILENT_BLOCK_COOLDOWN_HOURS = 24.0
+# proven 池少于该值时，优先继续探索未知域名，避免过早锁死在小样本上。
+DEFAULT_PROVEN_POOL_MIN = 5
+# proven 池足够大时，保留该比例的随机探索预算用于发现新的可用域名。
+DEFAULT_EXPLORE_RATIO = 0.15
 _DOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 _UNSUPPORTED_MARKERS = ("unsupported_email", "the email you provided is not supported")
+_CODE_MISSING_MARKERS = ("等待注册验证码超时", "等待 microsoft 登录验证码超时", "验证码超时")
+_OUTCOMES = frozenset({"accepted", "rejected", "neutral", "delivered", "no_code"})
 _lock = threading.RLock()
 
 
-def _threshold() -> int:
+def _env_int(name: str, default: int) -> int:
     try:
-        value = int(os.getenv("CHATGPT2API_MAIL_DOMAIN_FAILURE_THRESHOLD", ""))
-        if value >= 1:
+        value = int(os.getenv(name, ""))
+        if value >= 0:
             return value
     except ValueError:
         pass
-    return DEFAULT_FAILURE_THRESHOLD
+    return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, ""))
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    return default
+
+
+def _threshold() -> int:
+    return max(1, _env_int("CHATGPT2API_MAIL_DOMAIN_FAILURE_THRESHOLD", DEFAULT_FAILURE_THRESHOLD))
+
+
+def _silent_threshold() -> int:
+    return max(1, _env_int("CHATGPT2API_MAIL_DOMAIN_SILENT_THRESHOLD", DEFAULT_SILENT_FAILURE_THRESHOLD))
 
 
 def _cooldown_seconds() -> float:
-    try:
-        value = float(os.getenv("CHATGPT2API_MAIL_DOMAIN_BLOCK_COOLDOWN_HOURS", ""))
-        if value > 0:
-            return value * 3600.0
-    except ValueError:
-        pass
-    return DEFAULT_BLOCK_COOLDOWN_HOURS * 3600.0
+    return _env_float("CHATGPT2API_MAIL_DOMAIN_BLOCK_COOLDOWN_HOURS", DEFAULT_BLOCK_COOLDOWN_HOURS) * 3600.0
+
+
+def _silent_cooldown_seconds() -> float:
+    return _env_float("CHATGPT2API_MAIL_DOMAIN_SILENT_COOLDOWN_HOURS", DEFAULT_SILENT_BLOCK_COOLDOWN_HOURS) * 3600.0
+
+
+def _proven_pool_min() -> int:
+    return max(1, _env_int("CHATGPT2API_MAIL_DOMAIN_PROVEN_POOL_MIN", DEFAULT_PROVEN_POOL_MIN))
+
+
+def _explore_ratio() -> float:
+    return min(1.0, _env_float("CHATGPT2API_MAIL_DOMAIN_EXPLORE_RATIO", DEFAULT_EXPLORE_RATIO))
 
 
 def _now_iso() -> str:
@@ -72,6 +112,17 @@ def is_domain_rejected_error(error: object) -> bool:
     return any(marker in text for marker in _UNSUPPORTED_MARKERS)
 
 
+def is_code_missing_error(error: object) -> bool:
+    """识别"邮箱收不到验证码"这一类失败（域名静默丢信的弱信号）。"""
+    text = str(error or "")
+    if not text:
+        return False
+    if is_domain_rejected_error(text):
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _CODE_MISSING_MARKERS)
+
+
 def _default_item(domain: str) -> dict[str, Any]:
     return {
         "domain": domain,
@@ -79,11 +130,17 @@ def _default_item(domain: str) -> dict[str, Any]:
         "success_count": 0,
         "total_rejections": 0,
         "consecutive_rejections": 0,
+        "code_received_count": 0,
+        "no_code_count": 0,
+        "consecutive_no_code": 0,
         "last_used_at": "",
         "last_success_at": "",
         "last_rejected_at": "",
+        "last_code_at": "",
+        "last_no_code_at": "",
         "last_error": "",
         "blocked_at": "",
+        "silent_blocked_at": "",
     }
 
 
@@ -106,7 +163,15 @@ def _load_unlocked() -> dict[str, dict[str, Any]]:
         for key in item:
             if key in entry:
                 item[key] = entry[key]
-        for key in ("use_count", "success_count", "total_rejections", "consecutive_rejections"):
+        for key in (
+            "use_count",
+            "success_count",
+            "total_rejections",
+            "consecutive_rejections",
+            "code_received_count",
+            "no_code_count",
+            "consecutive_no_code",
+        ):
             try:
                 item[key] = max(0, int(item[key]))
             except (TypeError, ValueError):
@@ -127,32 +192,54 @@ def _save_unlocked(items: dict[str, dict[str, Any]]) -> None:
     os.replace(tmp_path, STATE_PATH)
 
 
+def _expired(blocked_at: str, cooldown: float, now: float) -> bool | None:
+    """返回 True=已过期，False=仍在冷却，None=时间戳损坏（按过期处理）。"""
+    if not blocked_at:
+        return False
+    try:
+        return now - datetime.fromisoformat(blocked_at).timestamp() >= cooldown
+    except ValueError:
+        return None
+
+
 def _unblock_expired_unlocked(items: dict[str, dict[str, Any]]) -> bool:
-    """冷却到期的拉黑域名半开重试：清零连续拒绝计数，重新进入可用池。"""
+    """冷却到期的拉黑域名半开重试：清零连续计数，重新进入可用池。"""
     cooldown = _cooldown_seconds()
+    silent_cooldown = _silent_cooldown_seconds()
     now = time.time()
     changed = False
     for item in items.values():
         blocked_at = str(item.get("blocked_at") or "")
-        if not blocked_at:
-            continue
-        try:
-            blocked_ts = datetime.fromisoformat(blocked_at).timestamp()
-        except ValueError:
-            item["blocked_at"] = ""
-            changed = True
-            continue
-        if now - blocked_ts >= cooldown:
-            item["blocked_at"] = ""
-            item["consecutive_rejections"] = 0
-            item["last_error"] = f"cooldown-expired@{ _now_iso() }"
-            changed = True
-            logger.info({"event": "mail_domain_cooldown_expired", "domain": item["domain"]})
+        if blocked_at:
+            expired = _expired(blocked_at, cooldown, now)
+            if expired is not False:
+                item["blocked_at"] = ""
+                item["consecutive_rejections"] = 0
+                item["last_error"] = f"cooldown-expired@{_now_iso()}"
+                changed = True
+                logger.info({"event": "mail_domain_cooldown_expired", "domain": item["domain"]})
+        silent_blocked_at = str(item.get("silent_blocked_at") or "")
+        if silent_blocked_at:
+            expired = _expired(silent_blocked_at, silent_cooldown, now)
+            if expired is not False:
+                item["silent_blocked_at"] = ""
+                item["consecutive_no_code"] = 0
+                item["last_error"] = f"silent-cooldown-expired@{_now_iso()}"
+                changed = True
+                logger.info({"event": "mail_domain_silent_cooldown_expired", "domain": item["domain"]})
     return changed
 
 
 def _is_blocked(item: dict[str, Any]) -> bool:
-    return bool(item.get("blocked_at")) or int(item.get("consecutive_rejections") or 0) >= _threshold()
+    return bool(
+        item.get("blocked_at")
+        or item.get("silent_blocked_at")
+        or int(item.get("consecutive_rejections") or 0) >= _threshold()
+    )
+
+
+def _proven(item: dict[str, Any] | None) -> bool:
+    return bool(item) and int(item.get("code_received_count") or 0) > 0
 
 
 def filter_domains(provider: str, domains: list[str]) -> list[str]:
@@ -194,24 +281,104 @@ def filter_domains(provider: str, domains: list[str]) -> list[str]:
     return available
 
 
+def select_domain(provider: str, domains: list[str]) -> str:
+    """在可用域名中挑一个：优先已证明能收信的域名，并保留少量探索预算。
+
+    分层：
+    - proven：收到过验证码，命中率最高；
+    - unknown：从未试过，需要探索；
+    - risky：试过但没收到信（未达拉黑阈值），最后才用。
+    """
+    available = filter_domains(provider, domains)
+    if not available:
+        return ""
+    with _lock:
+        items = _load_unlocked()
+    proven: list[str] = []
+    unknown: list[str] = []
+    risky: list[str] = []
+    for domain in available:
+        item = items.get(domain)
+        if _proven(item):
+            proven.append(domain)
+        elif int((item or {}).get("consecutive_no_code") or 0) > 0:
+            risky.append(domain)
+        else:
+            unknown.append(domain)
+    if len(proven) >= _proven_pool_min():
+        tier = "explore" if random.random() < _explore_ratio() and unknown else "proven"
+        candidates = unknown if tier == "explore" else proven
+    elif proven:
+        # proven 池还小：在"已验证"和"未探索"之间均分，兼顾利用与发现。
+        tier = "mixed"
+        candidates = proven + unknown
+    else:
+        tier = "discover"
+        candidates = unknown
+    if not candidates:
+        candidates = risky or available
+        tier = "fallback"
+    selected = random.choice(candidates)
+    logger.info({
+        "event": "mail_domain_selected",
+        "provider": str(provider or ""),
+        "domain": selected,
+        "tier": tier,
+        "available": len(available),
+        "proven": len(proven),
+        "unknown": len(unknown),
+        "risky": len(risky),
+    })
+    return selected
+
+
 def record_domain_result(provider: str, email_or_domain: object, outcome: str, error: object = "") -> dict[str, Any]:
-    """回报某次注册对域名的结果：accepted / rejected / neutral。"""
+    """回报某次注册对域名的结果。
+
+    outcome:
+    - accepted：注册成功（正向，清零各类连续失败计数）
+    - rejected：unsupported_email 等确定性拒绝（硬信号，按阈值拉黑）
+    - delivered：成功收到验证码（强正向，进入 proven 池）
+    - no_code：等待验证码超时（弱负向，连续多次且从未收到过验证码才拉黑）
+    - neutral：与域名无关的失败，不计数
+    """
     domain = normalize_domain(email_or_domain)
     action = str(outcome or "").strip().lower()
-    if not domain or action not in {"accepted", "rejected", "neutral"}:
+    if not domain or action not in _OUTCOMES:
         return {"matched": False, "blocked": False}
+    newly_blocked = False
+    newly_silent_blocked = False
     with _lock:
         items = _load_unlocked()
         item = items.setdefault(domain, _default_item(domain))
         item["use_count"] = int(item.get("use_count") or 0) + 1
         item["last_used_at"] = _now_iso()
-        newly_blocked = False
-        if action == "accepted":
+        if action == "delivered":
+            item["code_received_count"] = int(item.get("code_received_count") or 0) + 1
+            item["consecutive_no_code"] = 0
+            item["last_code_at"] = _now_iso()
+            item["last_error"] = ""
+            item["silent_blocked_at"] = ""
+        elif action == "no_code":
+            item["no_code_count"] = int(item.get("no_code_count") or 0) + 1
+            item["consecutive_no_code"] = int(item.get("consecutive_no_code") or 0) + 1
+            item["last_no_code_at"] = _now_iso()
+            item["last_error"] = str(error or "")[:200] or "verification code not delivered"
+            if (
+                item["consecutive_no_code"] >= _silent_threshold()
+                and int(item.get("code_received_count") or 0) == 0
+                and not item.get("silent_blocked_at")
+            ):
+                item["silent_blocked_at"] = _now_iso()
+                newly_silent_blocked = True
+        elif action == "accepted":
             item["success_count"] = int(item.get("success_count") or 0) + 1
             item["consecutive_rejections"] = 0
+            item["consecutive_no_code"] = 0
             item["last_success_at"] = _now_iso()
             item["last_error"] = ""
             item["blocked_at"] = ""
+            item["silent_blocked_at"] = ""
         elif action == "rejected":
             item["total_rejections"] = int(item.get("total_rejections") or 0) + 1
             item["consecutive_rejections"] = int(item.get("consecutive_rejections") or 0) + 1
@@ -230,35 +397,68 @@ def record_domain_result(provider: str, email_or_domain: object, outcome: str, e
             "consecutive_rejections": item["consecutive_rejections"],
             "error": str(error or "")[:200],
         })
+    if newly_silent_blocked:
+        logger.warning({
+            "event": "mail_domain_silent_blocked",
+            "provider": str(provider or ""),
+            "domain": domain,
+            "consecutive_no_code": item["consecutive_no_code"],
+            "code_received_count": int(item.get("code_received_count") or 0),
+        })
     return {
         "matched": True,
         "domain": domain,
-        "blocked": bool(item.get("blocked_at")),
+        "blocked": _is_blocked(item),
         "newly_blocked": newly_blocked,
+        "newly_silent_blocked": newly_silent_blocked,
         "consecutive_rejections": int(item.get("consecutive_rejections") or 0),
+        "consecutive_no_code": int(item.get("consecutive_no_code") or 0),
+        "code_received_count": int(item.get("code_received_count") or 0),
     }
 
 
 def stats_snapshot() -> dict[str, Any]:
     with _lock:
         items = _load_unlocked()
-        _unblock_expired_unlocked(items)
-        threshold = _threshold()
-        cooldown_hours = _cooldown_seconds() / 3600.0
+        if items and _unblock_expired_unlocked(items):
+            _save_unlocked(items)
         entries = []
         for item in items.values():
+            delivered = int(item.get("code_received_count") or 0)
+            no_code = int(item.get("no_code_count") or 0)
+            attempts = delivered + no_code
             entries.append({
                 **item,
                 "blocked": _is_blocked(item),
+                "delivery_rate": round(delivered / attempts, 3) if attempts else None,
             })
-        entries.sort(key=lambda entry: (-int(entry.get("total_rejections") or 0), entry["domain"]))
+        entries.sort(key=lambda entry: (
+            -int(entry.get("total_rejections") or 0),
+            -int(entry.get("no_code_count") or 0),
+            entry["domain"],
+        ))
+        proven = [entry for entry in entries if int(entry.get("code_received_count") or 0) > 0]
         return {
-            "threshold": threshold,
-            "cooldown_hours": round(cooldown_hours, 2),
+            "threshold": _threshold(),
+            "cooldown_hours": round(_cooldown_seconds() / 3600.0, 2),
+            "silent_threshold": _silent_threshold(),
+            "silent_cooldown_hours": round(_silent_cooldown_seconds() / 3600.0, 2),
+            "explore_ratio": _explore_ratio(),
             "summary": {
                 "total": len(entries),
                 "blocked": sum(1 for entry in entries if entry["blocked"]),
-                "healthy": sum(1 for entry in entries if not entry["blocked"] and int(entry.get("success_count") or 0) > 0),
+                "silent_blocked": sum(1 for entry in entries if entry.get("silent_blocked_at")),
+                "healthy": sum(
+                    1
+                    for entry in entries
+                    if not entry["blocked"] and int(entry.get("success_count") or 0) > 0
+                ),
+                "delivery_proven": len(proven),
+                "delivery_dead": sum(
+                    1
+                    for entry in entries
+                    if int(entry.get("no_code_count") or 0) > 0 and int(entry.get("code_received_count") or 0) == 0
+                ),
             },
             "items": entries,
             "updated_at": _now_iso(),
@@ -275,7 +475,9 @@ def reset_domain(domain_value: object) -> dict[str, Any]:
         if item is None:
             return {"ok": False, "error": "域名无记录"}
         item["consecutive_rejections"] = 0
+        item["consecutive_no_code"] = 0
         item["blocked_at"] = ""
+        item["silent_blocked_at"] = ""
         item["last_error"] = ""
         _save_unlocked(items)
     return {"ok": True, "domain": domain}

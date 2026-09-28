@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -86,9 +86,32 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.get("/api/register/mail-domains")
-    async def get_mail_domain_stats(authorization: str | None = Header(default=None)):
+    async def get_mail_domain_stats(
+        status: str = Query(default="all", description="all|blocked|proven|dead"),
+        keyword: str = Query(default=""),
+        limit: int = Query(default=0, ge=0, le=5000),
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
-        return mail_domain_stats.stats_snapshot()
+        snapshot = mail_domain_stats.stats_snapshot()
+        scope = str(status or "all").strip().lower()
+        needle = str(keyword or "").strip().lower()
+
+        def match(item: dict) -> bool:
+            if scope == "blocked" and not item.get("blocked"):
+                return False
+            if scope == "proven" and int(item.get("code_received_count") or 0) <= 0:
+                return False
+            if scope == "dead":
+                if int(item.get("no_code_count") or 0) <= 0 or int(item.get("code_received_count") or 0) > 0:
+                    return False
+            return not needle or needle in str(item.get("domain") or "")
+
+        items = [item for item in snapshot["items"] if match(item)]
+        total = len(items)
+        if limit:
+            items = items[:limit]
+        return {**snapshot, "items": items, "filtered_total": total, "filter": scope}
 
     @router.post("/api/register/mail-domains/reset")
     async def reset_mail_domain(body: MailDomainResetRequest, authorization: str | None = Header(default=None)):

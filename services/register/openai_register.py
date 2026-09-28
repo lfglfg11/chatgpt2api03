@@ -974,7 +974,9 @@ class PlatformRegistrar:
             step(index, "开始等待 Microsoft 登录验证码")
             code = wait_for_code(mailbox, register_proxy=self.proxy)
             if not code:
+                mail_provider.mark_mailbox_code_missing(mailbox)
                 raise RuntimeError("等待 Microsoft 登录验证码超时")
+            mail_provider.mark_mailbox_code_received(mailbox)
             step(index, f"收到 Microsoft 登录验证码: {code}")
             resp, error = validate_otp(self.session, self.device_id, code, self.fingerprint)
             if resp is not None and resp.status_code == 200:
@@ -1235,7 +1237,9 @@ class PlatformRegistrar:
                 step(index, "开始等待注册验证码")
                 code = wait_for_code(mailbox, register_proxy=self.proxy)
                 if not code:
+                    mail_provider.mark_mailbox_code_missing(mailbox)
                     raise RuntimeError("等待注册验证码超时")
+                mail_provider.mark_mailbox_code_received(mailbox)
                 step(index, f"收到注册验证码: {code}")
                 self._validate_otp(code, index)
                 self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)

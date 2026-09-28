@@ -1748,8 +1748,10 @@ class GptMail2Provider(BaseMailProvider):
         domains = _gptmail2_get_domains(self.api_base, self.conf, self.entry, force=False)
         if not domains:
             raise RuntimeError("GPTMail2 域名池为空")
-        domains = mail_domain_stats.filter_domains(self.name, domains)
-        domain = random.choice(domains)
+        # 优先复用历史上真正收到过验证码的域名：免费池里大部分域名会被静默丢信。
+        domain = mail_domain_stats.select_domain(self.name, domains)
+        if not domain:
+            raise RuntimeError("GPTMail2 域名池为空")
         prefix = (username or _random_mailbox_name()).strip().lower()
         prefix = re.sub(r"[^a-z0-9._-]+", "", prefix) or _random_mailbox_name()
         email = f"{prefix}@{domain}"
@@ -2858,6 +2860,14 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
             mail_domain_stats.record_domain_result(provider_name, address, "accepted")
         elif mail_domain_stats.is_domain_rejected_error(error):
             mail_domain_stats.record_domain_result(provider_name, address, "rejected", error)
+        elif mail_domain_stats.is_code_missing_error(error):
+            # 收不到验证码=域名静默丢信（弱信号）；与 mark_mailbox_code_missing 共享
+            # 一次性标记，避免同一封邮箱被重复计数。
+            if not mailbox.get("_no_code_reported"):
+                mailbox["_no_code_reported"] = True
+                mail_domain_stats.record_domain_result(
+                    provider_name, address, "no_code", error
+                )
         else:
             mail_domain_stats.record_domain_result(provider_name, address, "neutral")
     if provider_name != OutlookTokenProvider.name:
@@ -2880,6 +2890,25 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
             _set_outlook_token_state(login_email, "login_required", reason[:300])
     else:
         _set_outlook_token_state(address, "failed", reason[:300])
+
+
+def mark_mailbox_code_received(mailbox: dict) -> None:
+    """收到验证码即回报域名"可送达"：进入 proven 池，后续优先复用。"""
+    address = str(mailbox.get("address") or "").strip()
+    if address:
+        mail_domain_stats.record_domain_result(
+            str(mailbox.get("provider") or ""), address, "delivered"
+        )
+
+
+def mark_mailbox_code_missing(mailbox: dict) -> None:
+    """等待验证码超时：回报域名静默丢信（弱信号，连续多次且从未送达才拉黑）。"""
+    address = str(mailbox.get("address") or "").strip()
+    if address and not mailbox.get("_no_code_reported"):
+        mailbox["_no_code_reported"] = True
+        mail_domain_stats.record_domain_result(
+            str(mailbox.get("provider") or ""), address, "no_code", "verification code not delivered"
+        )
 
 
 def release_mailbox(mailbox: dict) -> None:
