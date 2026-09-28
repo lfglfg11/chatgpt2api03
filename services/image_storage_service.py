@@ -168,6 +168,28 @@ class ImageStorageService:
     def __init__(self, index_file: Path = IMAGE_INDEX_FILE):
         self.index_file = index_file
         self._index_lock = IMAGE_INDEX_LOCK
+        # 热路径（每张结果图落盘）原本都要重新解析整个索引 JSON（生产环境 9000+
+        # 条目 / 4.8MB ≈ 0.5s），而它又处在全局锁里，高并发时会把落盘阶段串行成
+        # 几十秒。这里按 (mtime_ns, size) 做跨进程失效判断，多 worker 写入后仍会
+        # 重新加载，但同一进程连续落盘不再重复解析。
+        self._index_cache: dict[str, dict[str, object]] | None = None
+        self._index_cache_key: tuple[int, int] | None = None
+
+    def _index_signature(self) -> tuple[int, int]:
+        try:
+            stat = self.index_file.stat()
+        except OSError:
+            return (0, 0)
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+
+    def _load_index_cached(self) -> dict[str, dict[str, object]]:
+        key = self._index_signature()
+        if self._index_cache is not None and self._index_cache_key == key:
+            return dict(self._index_cache)
+        items = self._load_clean_index()
+        self._index_cache = items
+        self._index_cache_key = key
+        return dict(items)
 
     def settings(self) -> dict[str, object]:
         return config.get_image_storage_settings()
@@ -188,6 +210,8 @@ class ImageStorageService:
 
     def _save_index(self, items: dict[str, dict[str, object]]) -> None:
         _write_json_object(self.index_file, {"items": items})
+        self._index_cache = dict(items)
+        self._index_cache_key = self._index_signature()
 
     def _public_url(self, rel: str, base_url: str | None = None) -> str:
         settings = self.settings()
@@ -204,7 +228,9 @@ class ImageStorageService:
         return f"{relative_dir.as_posix()}/{filename}"
 
     def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
-        config.cleanup_old_images()
+        # 过期图片清理已由启动时 + image-cleanup 后台线程（每 30 分钟）+
+        # 列表维护节流路径负责；这里原本每张图都 rglob 整个 images 目录
+        # （生产 9000+ 文件约 0.34s）并串行执行，是落盘阶段的主要拖累。
         rel = self.make_relative_path(image_data)
         mode = self.mode()
         if mode not in {"local", "webdav", "both"}:
@@ -239,7 +265,7 @@ class ImageStorageService:
         if dimensions:
             item["width"], item["height"] = dimensions
         with self._index_lock:
-            items = self._load_clean_index()
+            items = self._load_index_cached()
             items[rel] = item
             self._save_index(items)
         return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))

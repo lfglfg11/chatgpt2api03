@@ -177,7 +177,7 @@ class RealtimeMonitorService:
         self._completed: deque[dict[str, Any]] = deque(maxlen=completed_limit)
         self._events: deque[dict[str, Any]] = deque(maxlen=event_limit)
         self._threadpool: dict[str, int] = {
-            "tokens": _env_int("CHATGPT2API_THREAD_TOKENS", 80, 1),
+            "tokens": _env_int("CHATGPT2API_THREAD_TOKENS", 200, 1),
             "previous_tokens": 0,
         }
 

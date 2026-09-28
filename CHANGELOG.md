@@ -2,6 +2,8 @@
 
 ## Unreleased
 
++ [优化] 后端同步线程池容量默认值 `CHATGPT2API_THREAD_TOKENS` 由 80 提升到 200（`docker-compose.yml`、`docker-compose.warp.yml`、`Dockerfile`、`.env.example`、`deploy/install.sh` 与 Python 兜底同步调整）。高并发下实时监控的"入口排队"（生产实测 p95 92.8s）主要来自该容量：请求在进入处理函数前就排队，调大后入口不再成为瓶颈。
++ [优化] 图片结果落盘热路径：`image_storage_service.save()` 不再对整棵 images 目录做 `rglob` 过期清理（生产 9000+ 文件约 0.34s/张，且启动、后台 30 分钟线程与列表维护节流路径已覆盖），并把 4.8MB 索引 JSON 的解析改为按 `(mtime_ns, size)` 跨进程失效判断的缓存（原先每张图都重新解析，约 0.47s）。单张图落盘的串行临界区由约 1.33s 降到约 0.15s。
 + [优化] 静默拉黑冷却到期后，历史坏域名（累计丢信已达阈值且从未送达）首次丢信立即重新拉黑，避免约 1000 个已确认丢信域名每 24 小时回来时又各烧掉 2 次 80 秒等待。
 + [优化] 域名选择规避上游限流：GPTMail2 `inbox-token` 返回 429（`inbox_request_rate_limited`）时，记录该域名短冷却（默认 120 秒，`CHATGPT2API_MAIL_DOMAIN_THROTTLE_COOLDOWN_SECONDS`）并在冷却期内跳过，同时自动换域名重试最多 3 次，不再让一次限流响应废弃整个任务线程；限流不计入拒绝/丢信统计，避免误杀好域名。
 + [修复] 未知域名过少时不再强制探索（`CHATGPT2API_MAIL_DOMAIN_EXPLORE_MIN_POOL`，默认 3）：此前探索预算会反复落到同一个垃圾域名（如 ip6.arpa 反查名），浪费约 15% 的注册尝试。

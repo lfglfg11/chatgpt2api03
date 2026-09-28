@@ -34,7 +34,7 @@ def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = No
 
 
 def _configure_threadpool() -> None:
-    tokens = _env_int("CHATGPT2API_THREAD_TOKENS", 80, 1)
+    tokens = _env_int("CHATGPT2API_THREAD_TOKENS", 200, 1)
     limiter = current_default_thread_limiter()
     previous = int(getattr(limiter, "total_tokens", 0) or 0)
     if previous != tokens:
