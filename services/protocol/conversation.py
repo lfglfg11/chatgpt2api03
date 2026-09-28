@@ -1543,6 +1543,9 @@ def _image_result_output_from_urls(
         {"b64_json": base64.b64encode(image_data).decode("ascii")}
         for image_data in downloaded_images
     ]
+    # 下载完成到响应生成之间的耗时（base64 编解码 + 放大 + 落盘/索引写入）此前没有任何
+    # 埋点，高并发下全部落盘要抢同一个索引锁，UI 只能显示"下载图片"阶段在长时间等待。
+    storage_started = time.perf_counter()
     formatted = format_image_result(
         image_items,
         request.prompt,
@@ -1551,6 +1554,24 @@ def _image_result_output_from_urls(
         int(time.time()),
         requested_size=request.size,
     )
+    storage_ms = int((time.perf_counter() - storage_started) * 1000)
+    if request.trace_image_perf:
+        _monitor_image_stage(
+            request,
+            "image_result_stored",
+            conversation_id=conversation_id,
+            storage_ms=storage_ms,
+            url_count=len(image_items),
+            index=index,
+            total=total,
+        )
+        logger.info({
+            "event": "image_result_stored",
+            "call_id": request.call_id,
+            "conversation_id": conversation_id,
+            "storage_ms": storage_ms,
+            "image_count": len(image_items),
+        })
     data = formatted["data"]
     if not data:
         return None

@@ -58,6 +58,7 @@ const DIGEST_METRIC_PAIRS = [
   ['查询结果', 'poll_request_ms'],
   ['结果处理', 'resolve_ms'],
   ['下载', 'download_ms'],
+  ['结果落盘', 'storage_ms'],
 ] as const
 
 const SLOW_METRIC_PAIRS = [
@@ -85,6 +86,7 @@ const SLOW_METRIC_PAIRS = [
   { key: 'poll_request_ms', label: '查询结果' },
   { key: 'resolve_ms', label: '结果处理' },
   { key: 'download_ms', label: '下载' },
+  { key: 'storage_ms', label: '结果落盘' },
   { key: 'response_ms', label: '响应整理' },
 ]
 
@@ -108,6 +110,7 @@ const EVENT_METRIC_PAIRS = [
   ['查询结果', 'poll_request_ms'],
   ['结果处理', 'resolve_ms'],
   ['下载', 'download_ms'],
+  ['结果落盘', 'storage_ms'],
   ['响应整理', 'response_ms'],
 ] as const
 
@@ -136,6 +139,7 @@ const RECORD_SIGNATURE_METRIC_KEYS = [
   'poll_request_ms',
   'resolve_ms',
   'download_ms',
+  'storage_ms',
   'response_ms',
   'stream_ms',
   'total_ms',
