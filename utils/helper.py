@@ -150,6 +150,8 @@ def is_image_chat_request(body: dict[str, object]) -> bool:
 
 
 _UPSTREAM_BODY_LOG_LIMIT = 500
+# 读取失败响应体时最多读这么多字节（stream=True 时只能靠 iter_content 读）。
+_UPSTREAM_ERROR_BODY_LIMIT = 64 * 1024
 
 
 class UpstreamHTTPError(RuntimeError):
@@ -193,10 +195,10 @@ class UpstreamHTTPError(RuntimeError):
 def _read_error_body(response: Any) -> Any:
     """读取失败响应的响应体（解析成 JSON，失败则返回文本）。
 
-    curl_cffi 在 ``stream=True`` 时不会自动缓冲响应体，错误路径上直接取
-    ``response.text`` 往往得到空串——上游真实的错误信息（例如
-    ``{"detail":"Model not found"}``）会被丢掉，导致归因失真、日志里只剩
-    ``status=404, body=``。这里在错误路径上显式读一次内容。
+    curl_cffi 在 ``stream=True`` 时不会自动缓冲响应体：``content`` 与 ``text``
+    恒为空串，只有 ``iter_content()`` 能真正读到内容。错误路径上不处理这一点，
+    上游真实的错误信息（例如 ``{"detail":"Model not found"}``）就会被丢掉，
+    日志与对外错误只剩 ``status=404, body=``，归因随之失真。
     """
     raw: bytes = b""
     try:
@@ -208,6 +210,21 @@ def _read_error_body(response: Any) -> Any:
             raw = str(response.text or "").encode("utf-8", "replace")
         except Exception:
             raw = b""
+    if not raw:
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            for chunk in response.iter_content(4096):
+                if not chunk:
+                    continue
+                data = bytes(chunk)
+                chunks.append(data)
+                total += len(data)
+                if total >= _UPSTREAM_ERROR_BODY_LIMIT:
+                    break
+        except Exception:
+            chunks = []
+        raw = b"".join(chunks)
     if not raw:
         return ""
     text = raw.decode("utf-8", "replace")
