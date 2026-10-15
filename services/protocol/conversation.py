@@ -15,6 +15,7 @@ from curl_cffi.requests import exceptions as curl_exceptions
 from services.account_service import ImageAccountSelectionError, account_service
 from services.config import config
 from services.image_failure import (
+    IMAGE_UPSTREAM_BLOCKED_PUBLIC_MESSAGE,
     ImageDownloadError,
     ImageFailure,
     ImageGenerationError,
@@ -36,6 +37,7 @@ from services.image_storage_service import image_storage_service
 from services.image_upscale_service import upscale_image_if_needed
 from services.openai_backend_api import OpenAIBackendAPI
 from services.proxy_service import proxy_settings
+from services.upstream_block_guard import upstream_block_guard
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.helper import (
     IMAGE_MODELS,
@@ -2002,6 +2004,27 @@ def _generate_single_image(
     )
     single_started = time.perf_counter()
 
+    if upstream_block_guard.should_short_circuit():
+        guard_state = upstream_block_guard.state()
+        logger.warning({
+            "event": "image_upstream_block_short_circuit",
+            "call_id": request.call_id,
+            "index": index,
+            "total": total,
+            **guard_state,
+        })
+        raise ImageGenerationError(
+            IMAGE_UPSTREAM_BLOCKED_PUBLIC_MESSAGE,
+            failure=image_failure(
+                "upstream_model_blocked",
+                raw_detail=(
+                    "circuit-open remaining="
+                    f"{guard_state.get('remaining_seconds')}s"
+                ),
+            ),
+            raw_error=IMAGE_UPSTREAM_BLOCKED_PUBLIC_MESSAGE,
+        )
+
     def attach_attempts(value: Any) -> Any:
         value.image_attempts = [dict(item) for item in image_attempts]
         return value
@@ -2115,6 +2138,12 @@ def _generate_single_image(
             if image_slot_finalized:
                 return
             image_slot_finalized = True
+            if success:
+                # 任意一次真实成功都说明上游恢复，立即解除熔断。
+                upstream_block_guard.record_success()
+            elif failure is not None and failure.code == "upstream_model_blocked":
+                # 上游会话接口整体故障：累计到阈值就短路，避免继续空转烧账号。
+                upstream_block_guard.record_blocked()
             try:
                 account_service.mark_image_result(
                     token,

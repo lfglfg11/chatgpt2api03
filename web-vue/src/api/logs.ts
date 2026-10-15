@@ -232,6 +232,7 @@ const TEXT_REVIEW_FAILURE_CODES = new Set([
 
 const IMAGE_FAILURE_LABELS: Record<string, string> = {
   upstream_error: '上游请求失败',
+  upstream_model_blocked: '上游会话接口故障（Model not found）',
   internal_error: '内部处理异常',
   upstream_unavailable: '上游服务暂不可用',
   upstream_connection_failed: '无法连接上游',

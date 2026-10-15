@@ -17,6 +17,10 @@ class FailurePolicy:
     retryable: bool
     status_code: int
     error_type: str
+    # False when the failure is proven to be upstream-wide rather than the
+    # account's fault: such a failure must neither penalize the account nor
+    # rotate to another one (every account fails identically).
+    account_fault: bool = True
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,7 @@ class ImageFailure:
     error_type: str
     raw_detail: Any = field(default=None, compare=False, repr=False)
     public_detail: str = field(default="", compare=False, repr=False)
+    account_fault: bool = field(default=True, compare=False)
 
     @property
     def outcome(self) -> str:
@@ -37,11 +42,11 @@ class ImageFailure:
 
     @property
     def switch_account(self) -> bool:
-        return self.outcome == "failure"
+        return self.outcome == "failure" and self.account_fault
 
     @property
     def verify_account(self) -> bool:
-        return self.outcome == "failure"
+        return self.outcome == "failure" and self.account_fault
 
     @property
     def account_failure(self) -> bool:
@@ -69,6 +74,13 @@ class ImageFailure:
 FAILURE_POLICIES: dict[str, FailurePolicy] = {
     "upstream_error": FailurePolicy(
         "transient", None, False, 502, "server_error",
+    ),
+    # OpenAI 侧会话接口故障：POST /backend-api/f/conversation 返回
+    # 404 {"detail":"Model not found"}，且与账号/请求头/时区/出口 IP 均无关
+    # （同一秒同一 IP 下不同账号表现不同，可用账号对任意 model 名都返回 200）。
+    # 这不是账号问题：不得给账号记失败，也不该换账号重试。
+    "upstream_model_blocked": FailurePolicy(
+        "upstream", None, False, 502, "server_error", account_fault=False,
     ),
     "internal_error": FailurePolicy(
         "internal", None, False, 500, "server_error",
@@ -219,12 +231,47 @@ def image_failure(
         status_code=policy.status_code,
         error_type=policy.error_type,
         raw_detail=raw_detail,
+        account_fault=policy.account_fault,
     )
+
+
+_MODEL_NOT_FOUND_MARKERS = ("model not found", "model_not_found")
+
+
+def is_upstream_model_blocked(status_code: Any, body: Any) -> bool:
+    """判断是否命中 OpenAI 侧「会话接口不可用」的伪装 404。
+
+    线上取证（2026-10-15 起）：POST /backend-api/conversation 与
+    /backend-api/f/conversation 对绝大多数账号返回 404
+    ``{"detail":"Model not found"}``，但同一账号的 /backend-api/me、
+    /backend-api/models、/backend-api/f/conversation/prepare 全部 200；
+    换 Accept-Language / OAI-Language / timezone / 出口 IP / client version /
+    设备指纹 / model slug（含明显非法的 slug）都不改变结果。
+    因此这条错误是上游故障的通用拒绝，而不是真的模型解析失败。
+    """
+    try:
+        if int(status_code) != 404:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if isinstance(body, (dict, list, tuple)):
+        try:
+            text = json.dumps(body, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = repr(body)
+    else:
+        text = str(body or "")
+    lowered = text.lower()
+    return any(marker in lowered for marker in _MODEL_NOT_FOUND_MARKERS)
 
 
 IMAGE_TIMEOUT_PUBLIC_MESSAGE = "Image generation timed out. Please try again."
 IMAGE_TOOL_ERROR_PUBLIC_MESSAGE = "The image generation tool encountered an error. Please try again."
 IMAGE_QUOTA_PUBLIC_MESSAGE = "No image generation quota is currently available."
+IMAGE_UPSTREAM_BLOCKED_PUBLIC_MESSAGE = (
+    "上游 ChatGPT 会话接口当前不可用（/backend-api/f/conversation 返回 "
+    "404 Model not found，OpenAI 侧故障），请稍后重试。"
+)
 
 _PUBLIC_RAW_DETAIL_CODES = frozenset({
     "content_policy_violation",
@@ -321,6 +368,8 @@ def public_image_error_message(
         return IMAGE_TIMEOUT_PUBLIC_MESSAGE
     if failure.code in {"image_stream_interrupted", "image_stream_timeout"}:
         return IMAGE_TOOL_ERROR_PUBLIC_MESSAGE
+    if failure.code == "upstream_model_blocked":
+        return IMAGE_UPSTREAM_BLOCKED_PUBLIC_MESSAGE
 
     upstream_text = _public_upstream_text(failure, error)
     if upstream_text:
@@ -456,6 +505,9 @@ def _failure_priority(code: str) -> int:
     normalized = FAILURE_CODE_ALIASES.get(str(code or "").strip().lower(), str(code or "").strip().lower())
     if normalized == "auth_invalid":
         return 8
+    if normalized == "upstream_model_blocked":
+        # 上游整体故障：只要有一个 slot 命中，就该优先如实上报。
+        return 7
     if normalized in {"image_quota_exhausted", "insufficient_quota"}:
         return 7
     if normalized in {"file_upload_throttled", "upstream_rate_limited"}:
@@ -582,6 +634,14 @@ def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
             failure,
             status_code=status_code,
             scope="delivery" if credential_scope == "signed_asset" else failure.scope,
+        )
+
+    if is_upstream_model_blocked(status_code, exc.body):
+        # 上游会话接口整体故障：不归因账号、不换账号重试。
+        return image_failure(
+            "upstream_model_blocked",
+            retry_after=retry_after,
+            raw_detail=exc.body,
         )
 
     if status_code == 401:

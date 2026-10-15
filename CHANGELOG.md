@@ -2,6 +2,8 @@
 
 ## Unreleased
 
++ [修复] 上游会话接口整体故障（`404 {"detail":"Model not found"}`）被误判为账号故障，导致每个请求白烧 4 个账号并把号池 fail 计数打满。新增失败码 `upstream_model_blocked`：`account_fault=False`，既不给账号记失败、也不换账号重试，并按"上游故障"优先上报。取证：2026-10-15 起 `POST /backend-api/conversation` 与 `/backend-api/f/conversation` 对约 96% 账号返回该 404，而同账号的 `/backend-api/me`、`/backend-api/models`、`/backend-api/f/conversation/prepare` 全部 200；换 Accept-Language / OAI-Language / timezone / 出口 IP（WARP 与直连）/ client version / 设备指纹 / model slug（含明显非法 slug）都不改变结果——可用账号对任意 model 名都返回 200，证明该 404 是上游通用拒绝而非模型解析失败。
++ [新增] 图片链路上游熔断器 `services/upstream_block_guard.py`：连续 3 次（`CHATGPT2API_UPSTREAM_BLOCK_FAILURE_THRESHOLD`）命中 `upstream_model_blocked` 即短路 180 秒（`CHATGPT2API_UPSTREAM_BLOCK_COOLDOWN_SECONDS`，上限 `CHATGPT2API_UPSTREAM_BLOCK_MAX_COOLDOWN_SECONDS` 默认 1800 秒），期间直接快速失败并返回可读错误，冷却结束只放行一个探针请求；探针成功即恢复，失败则冷却翻倍。避免上游故障期间持续制造无效请求。
 + [新增] 图片结果落盘阶段（`image_result_stored` / `storage_ms`，含放大与索引写入）补齐实时监控埋点与日志：此前"下载完成 → 响应生成"这段无任何埋点，高并发抢索引锁时 UI 只能显示卡在"下载图片"阶段，无法定位。前端监控新增"结果落盘"指标与阶段显示。
 + [优化] 后端同步线程池容量默认值 `CHATGPT2API_THREAD_TOKENS` 由 80 提升到 200（`docker-compose.yml`、`docker-compose.warp.yml`、`Dockerfile`、`.env.example`、`deploy/install.sh` 与 Python 兜底同步调整）。高并发下实时监控的"入口排队"（生产实测 p95 92.8s）主要来自该容量：请求在进入处理函数前就排队，调大后入口不再成为瓶颈。
 + [优化] 图片结果落盘热路径：`image_storage_service.save()` 不再对整棵 images 目录做 `rglob` 过期清理（生产 9000+ 文件约 0.34s/张，且启动、后台 30 分钟线程与列表维护节流路径已覆盖），并把 4.8MB 索引 JSON 的解析改为按 `(mtime_ns, size)` 跨进程失效判断的缓存（原先每张图都重新解析，约 0.47s）。单张图落盘的串行临界区由约 1.33s 降到约 0.15s。
