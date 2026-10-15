@@ -2039,7 +2039,12 @@ def _generate_single_image(
         error: ImageGenerationError | None = None,
     ) -> bool:
         nonlocal retry_token, fallback_retry_pending, retry_error, pending_switch_attempt_index
-        if not failure.switch_account or len(image_attempts) >= max_account_attempts:
+        allow_switch = failure.switch_account
+        if not allow_switch and failure.code == "upstream_model_blocked":
+            # 上游整体故障默认不换号（换也没用，纯烧账号与时间）；但窗口内若确实
+            # 出过图，说明只是"部分账号被挡"，此时换号是唯一能救回成功率的手段。
+            allow_switch = upstream_block_guard.recent_success()
+        if not allow_switch or len(image_attempts) >= max_account_attempts:
             return False
         retry_token = ""
         fallback_retry_pending = False

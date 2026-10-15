@@ -34,11 +34,16 @@ DEFAULT_MAX_COOLDOWN_SECONDS = 300.0
 # 探针看门狗：放行探针后若它在此时限内没有回报结果（账号选择失败、进程中断、
 # 异常绕过 finalize 等），视为探针丢失，允许下一次探针，避免熔断器永久卡死。
 DEFAULT_PROBE_TIMEOUT_SECONDS = 300.0
+# 只要窗口内出现过任意一次真实成功，就说明上游仍有可用账号（部分故障），
+# 此时既不熔断也不禁止换号重试——否则"3 连败即熔断"会在少量账号可用时
+# 把仅有的成功率也一起掐死。
+DEFAULT_SUCCESS_WINDOW_SECONDS = 900.0
 
 ENV_FAILURE_THRESHOLD = "CHATGPT2API_UPSTREAM_BLOCK_FAILURE_THRESHOLD"
 ENV_COOLDOWN_SECONDS = "CHATGPT2API_UPSTREAM_BLOCK_COOLDOWN_SECONDS"
 ENV_MAX_COOLDOWN_SECONDS = "CHATGPT2API_UPSTREAM_BLOCK_MAX_COOLDOWN_SECONDS"
 ENV_PROBE_TIMEOUT_SECONDS = "CHATGPT2API_UPSTREAM_BLOCK_PROBE_TIMEOUT_SECONDS"
+ENV_SUCCESS_WINDOW_SECONDS = "CHATGPT2API_UPSTREAM_BLOCK_SUCCESS_WINDOW_SECONDS"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -75,6 +80,8 @@ class UpstreamBlockGuard:
         self._probe_started_at = 0.0
         self._total_blocked = 0
         self._total_probes = 0
+        self._total_successes = 0
+        self._last_success_monotonic = 0.0
         self._last_blocked_at = 0.0
         self._last_recovered_at = 0.0
 
@@ -94,6 +101,18 @@ class UpstreamBlockGuard:
     def probe_timeout(self) -> float:
         return _env_float(ENV_PROBE_TIMEOUT_SECONDS, DEFAULT_PROBE_TIMEOUT_SECONDS)
 
+    @property
+    def success_window(self) -> float:
+        return _env_float(ENV_SUCCESS_WINDOW_SECONDS, DEFAULT_SUCCESS_WINDOW_SECONDS)
+
+    def recent_success(self, window_seconds: float | None = None) -> bool:
+        """窗口内是否出现过真实成功（= 上游仍有可用账号，属于部分故障）。"""
+        window = self.success_window if window_seconds is None else window_seconds
+        with self._lock:
+            if self._last_success_monotonic <= 0.0:
+                return False
+            return (time.monotonic() - self._last_success_monotonic) < window
+
     def record_blocked(self) -> None:
         """记录一次真实命中的上游整体故障。"""
         now = time.monotonic()
@@ -112,13 +131,21 @@ class UpstreamBlockGuard:
                 )
                 self._opened_at = now
                 return
-            if self._consecutive >= self.threshold:
-                if self._opened_at <= 0.0:
-                    self._cooldown = self.base_cooldown
-                self._opened_at = now
+            if self._consecutive < self.threshold:
+                return
+            # 窗口内有过成功 → 上游只是部分故障，熔断会连带掐死仅有的成功率，
+            # 因此不熔断（换号重试的开关由 recent_success 单独控制）。
+            if self._last_success_monotonic > 0.0 and (
+                now - self._last_success_monotonic
+            ) < self.success_window:
+                return
+            if self._opened_at <= 0.0:
+                self._cooldown = self.base_cooldown
+            self._opened_at = now
 
     def record_success(self) -> None:
         """任意一次真实成功都说明上游恢复（或本进程判断有误），立即复位。"""
+        now = time.monotonic()
         with self._lock:
             recovered = self._opened_at > 0.0
             self._consecutive = 0
@@ -126,6 +153,8 @@ class UpstreamBlockGuard:
             self._cooldown = 0.0
             self._probe_in_flight = False
             self._probe_started_at = 0.0
+            self._total_successes += 1
+            self._last_success_monotonic = now
             if recovered:
                 self._last_recovered_at = time.time()
 
@@ -163,8 +192,14 @@ class UpstreamBlockGuard:
                 "remaining_seconds": round(remaining, 3),
                 "probe_in_flight": self._probe_in_flight,
                 "probe_timeout_seconds": self.probe_timeout,
+                "success_window_seconds": self.success_window,
+                "recent_success": (
+                    self._last_success_monotonic > 0.0
+                    and (now - self._last_success_monotonic) < self.success_window
+                ),
                 "total_blocked": self._total_blocked,
                 "total_probes": self._total_probes,
+                "total_successes": self._total_successes,
                 "last_blocked_at": self._last_blocked_at,
                 "last_recovered_at": self._last_recovered_at,
             }
