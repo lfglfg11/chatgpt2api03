@@ -190,6 +190,33 @@ class UpstreamHTTPError(RuntimeError):
         super().__init__(f"{context} failed: status={status_code}, body={body_str}")
 
 
+def _read_error_body(response: Any) -> Any:
+    """读取失败响应的响应体（解析成 JSON，失败则返回文本）。
+
+    curl_cffi 在 ``stream=True`` 时不会自动缓冲响应体，错误路径上直接取
+    ``response.text`` 往往得到空串——上游真实的错误信息（例如
+    ``{"detail":"Model not found"}``）会被丢掉，导致归因失真、日志里只剩
+    ``status=404, body=``。这里在错误路径上显式读一次内容。
+    """
+    raw: bytes = b""
+    try:
+        raw = bytes(response.content or b"")
+    except Exception:
+        raw = b""
+    if not raw:
+        try:
+            raw = str(response.text or "").encode("utf-8", "replace")
+        except Exception:
+            raw = b""
+    if not raw:
+        return ""
+    text = raw.decode("utf-8", "replace")
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
 def ensure_ok(
     response: requests.Response,
     context: str,
@@ -198,11 +225,7 @@ def ensure_ok(
 ) -> None:
     if 200 <= response.status_code < 300:
         return
-    body: Any = response.text
-    try:
-        body = response.json()
-    except Exception:
-        pass
+    body: Any = _read_error_body(response)
     retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
     retry_after: int | None = None
     if retry_after_header is not None:

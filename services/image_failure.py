@@ -237,8 +237,16 @@ def image_failure(
 
 _MODEL_NOT_FOUND_MARKERS = ("model not found", "model_not_found")
 
+# 这两个端点是"新建会话"的入口：带有效凭证时正常不会返回 404。线上实测
+# （curl_cffi stream=True 的错误响应体常常读不出来，表现为 body=）时，
+# 空 body 的 404 就是同一个上游故障。
+_MODEL_BLOCKED_EMPTY_BODY_PATHS = frozenset({
+    "/backend-api/conversation",
+    "/backend-api/f/conversation",
+})
 
-def is_upstream_model_blocked(status_code: Any, body: Any) -> bool:
+
+def is_upstream_model_blocked(status_code: Any, body: Any, context: str = "") -> bool:
     """判断是否命中 OpenAI 侧「会话接口不可用」的伪装 404。
 
     线上取证（2026-10-15 起）：POST /backend-api/conversation 与
@@ -262,7 +270,13 @@ def is_upstream_model_blocked(status_code: Any, body: Any) -> bool:
     else:
         text = str(body or "")
     lowered = text.lower()
-    return any(marker in lowered for marker in _MODEL_NOT_FOUND_MARKERS)
+    if any(marker in lowered for marker in _MODEL_NOT_FOUND_MARKERS):
+        return True
+    if text.strip():
+        # 有响应体但不是这个签名：交给常规 404 处理，不扩大判定范围。
+        return False
+    path = str(context or "").split("?", 1)[0].rstrip("/").lower()
+    return path in _MODEL_BLOCKED_EMPTY_BODY_PATHS
 
 
 IMAGE_TIMEOUT_PUBLIC_MESSAGE = "Image generation timed out. Please try again."
@@ -636,7 +650,7 @@ def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
             scope="delivery" if credential_scope == "signed_asset" else failure.scope,
         )
 
-    if is_upstream_model_blocked(status_code, exc.body):
+    if is_upstream_model_blocked(status_code, exc.body, context_path):
         # 上游会话接口整体故障：不归因账号、不换账号重试。
         return image_failure(
             "upstream_model_blocked",
