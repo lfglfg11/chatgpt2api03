@@ -27,11 +27,18 @@ from typing import Any
 
 DEFAULT_FAILURE_THRESHOLD = 3
 DEFAULT_COOLDOWN_SECONDS = 180.0
-DEFAULT_MAX_COOLDOWN_SECONDS = 1800.0
+# 冷却上限刻意压得比较低：探针本身只有一个请求，翻倍省不下多少上游压力，
+# 却会把"上游恢复后重新放行"的最坏延迟拉长到几十分钟。300s 意味着恢复后
+# 最迟 5 分钟内一定会重新放量。
+DEFAULT_MAX_COOLDOWN_SECONDS = 300.0
+# 探针看门狗：放行探针后若它在此时限内没有回报结果（账号选择失败、进程中断、
+# 异常绕过 finalize 等），视为探针丢失，允许下一次探针，避免熔断器永久卡死。
+DEFAULT_PROBE_TIMEOUT_SECONDS = 300.0
 
 ENV_FAILURE_THRESHOLD = "CHATGPT2API_UPSTREAM_BLOCK_FAILURE_THRESHOLD"
 ENV_COOLDOWN_SECONDS = "CHATGPT2API_UPSTREAM_BLOCK_COOLDOWN_SECONDS"
 ENV_MAX_COOLDOWN_SECONDS = "CHATGPT2API_UPSTREAM_BLOCK_MAX_COOLDOWN_SECONDS"
+ENV_PROBE_TIMEOUT_SECONDS = "CHATGPT2API_UPSTREAM_BLOCK_PROBE_TIMEOUT_SECONDS"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -65,7 +72,9 @@ class UpstreamBlockGuard:
         self._opened_at = 0.0
         self._cooldown = 0.0
         self._probe_in_flight = False
+        self._probe_started_at = 0.0
         self._total_blocked = 0
+        self._total_probes = 0
         self._last_blocked_at = 0.0
         self._last_recovered_at = 0.0
 
@@ -81,6 +90,10 @@ class UpstreamBlockGuard:
     def max_cooldown(self) -> float:
         return _env_float(ENV_MAX_COOLDOWN_SECONDS, DEFAULT_MAX_COOLDOWN_SECONDS)
 
+    @property
+    def probe_timeout(self) -> float:
+        return _env_float(ENV_PROBE_TIMEOUT_SECONDS, DEFAULT_PROBE_TIMEOUT_SECONDS)
+
     def record_blocked(self) -> None:
         """记录一次真实命中的上游整体故障。"""
         now = time.monotonic()
@@ -88,9 +101,11 @@ class UpstreamBlockGuard:
             self._total_blocked += 1
             self._last_blocked_at = time.time()
             self._consecutive += 1
-            if self._probe_in_flight:
+            was_probe = self._probe_in_flight
+            self._probe_in_flight = False
+            self._probe_started_at = 0.0
+            if was_probe:
                 # 探针也失败了：重新开闸并翻倍冷却。
-                self._probe_in_flight = False
                 self._cooldown = min(
                     max(self._cooldown * 2, self.base_cooldown),
                     self.max_cooldown,
@@ -110,6 +125,7 @@ class UpstreamBlockGuard:
             self._opened_at = 0.0
             self._cooldown = 0.0
             self._probe_in_flight = False
+            self._probe_started_at = 0.0
             if recovered:
                 self._last_recovered_at = time.time()
 
@@ -122,8 +138,14 @@ class UpstreamBlockGuard:
             if now - self._opened_at < self._cooldown:
                 return True
             if self._probe_in_flight:
-                return True
+                # 看门狗：探针超时未回报（账号选择失败、进程中断等）视为丢失，
+                # 否则 _probe_in_flight 会永久为 True，熔断器再也放不出请求。
+                if now - self._probe_started_at < self.probe_timeout:
+                    return True
+                self._probe_in_flight = False
             self._probe_in_flight = True
+            self._probe_started_at = now
+            self._total_probes += 1
             return False
 
     def state(self) -> dict[str, Any]:
@@ -140,7 +162,9 @@ class UpstreamBlockGuard:
                 "cooldown_seconds": round(self._cooldown, 3),
                 "remaining_seconds": round(remaining, 3),
                 "probe_in_flight": self._probe_in_flight,
+                "probe_timeout_seconds": self.probe_timeout,
                 "total_blocked": self._total_blocked,
+                "total_probes": self._total_probes,
                 "last_blocked_at": self._last_blocked_at,
                 "last_recovered_at": self._last_recovered_at,
             }
@@ -152,6 +176,7 @@ class UpstreamBlockGuard:
             self._opened_at = 0.0
             self._cooldown = 0.0
             self._probe_in_flight = False
+            self._probe_started_at = 0.0
 
 
 upstream_block_guard = UpstreamBlockGuard()
