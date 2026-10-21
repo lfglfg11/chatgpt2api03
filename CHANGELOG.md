@@ -2,6 +2,8 @@
 
 ## Unreleased
 
++ [修复] proven 邮箱域名不再"一次送达终身豁免"：实测 483 个 proven 域名里 **371 个已 >7 天没送达**，个别域名"成功 1 次、之后连续丢信 600+ 次"仍在被优先选中，把注册成功率压在 10%（事后逐个查收件箱确认：8/8 超时邮箱里**一封邮件都没有**，不是晚到而是根本没投递）。现在 proven 域名有两条降级条件：① 连续丢信 ≥ `CHATGPT2API_MAIL_DOMAIN_PROVEN_THRESHOLD`（默认 10；健康域名通常只有 0~3 次）；② 最后一次送达超过 `CHATGPT2API_MAIL_DOMAIN_PROVEN_STALE_DAYS`（默认 7 天）且连续丢信 ≥ 静默阈值。两者都走原有 24 小时冷却、到期自动半开重试，不会永久封死。
+
 + [修复] 注册链路的邮箱 429 改为按出口 IP 分流：GPTMail2 的 `429 inbox_rate_limited`（`retry_after: 60`）是**按出口 IP** 计的额度桶（实测：warp 单 IP 8/8 全 429；换一条德国住宅代理 5/5 全 200；同一条代理连续 12/12 全 200）。新增 `services/register/mail_proxy_pool.py`：邮箱 API 走专用代理池（`data/mail_proxy_pool.txt`，每行一条 socks5/http 代理），**OpenAI 注册请求仍走 `register.json` 顶层 proxy 不变**，代理流量只消耗在建邮箱/读信这类小请求上。每个请求都从池里**轮询均摊**取一个出口（200 条全用上，不做任何固定绑定），收到 429 时只冷却该出口（按上游 `retry_after`）并换下一个，不再"0.6 秒后换域名硬打同一个 IP"。开关：`CHATGPT2API_MAIL_PROXY_POOL=0` 关闭，`CHATGPT2API_MAIL_PROXY_POOL_FILE` 指定路径。
 + [修复] 读验证码邮件时的一次 429 不再判死整个注册任务：`fetch_latest_message` 命中限流时返回 None，让 80 秒等待窗口继续（下一轮自动换出口重试）。此前 60 分钟 4044 个任务里，1358 个已发出 OTP 的任务中只有 48 个走到建号，其余几乎全部死在这一步。
 

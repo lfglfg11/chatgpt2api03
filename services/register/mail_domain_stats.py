@@ -37,6 +37,12 @@ DEFAULT_BLOCK_COOLDOWN_HOURS = 6.0
 # 静默丢信（OTP 超时）是弱信号，需要连续多次确认才拉黑。
 DEFAULT_SILENT_FAILURE_THRESHOLD = 2
 DEFAULT_SILENT_BLOCK_COOLDOWN_HOURS = 24.0
+# proven（曾经送达过）域名的降级阈值。原实现"送达过的域名永不拉黑"留下了大量
+# 僵尸域名：实测 483 个 proven 域名里 371 个已经 >7 天没送达，个别域名
+# 「成功 1 次、之后连续丢信 600+ 次」仍在被优先选中，直接把注册成功率压到 10%。
+# 健康域名连续丢信通常只有 0~3 次，用 10 次可以干净区分、不会误杀。
+DEFAULT_PROVEN_FAILURE_THRESHOLD = 10
+DEFAULT_PROVEN_STALE_DAYS = 7.0
 # proven 池少于该值时，优先继续探索未知域名，避免过早锁死在小样本上。
 DEFAULT_PROVEN_POOL_MIN = 5
 # proven 池足够大时，保留该比例的随机探索预算用于发现新的可用域名。
@@ -91,6 +97,15 @@ def _silent_cooldown_seconds() -> float:
 
 def _proven_pool_min() -> int:
     return max(1, _env_int("CHATGPT2API_MAIL_DOMAIN_PROVEN_POOL_MIN", DEFAULT_PROVEN_POOL_MIN))
+
+
+def _proven_threshold() -> int:
+    return max(2, _env_int("CHATGPT2API_MAIL_DOMAIN_PROVEN_THRESHOLD", DEFAULT_PROVEN_FAILURE_THRESHOLD))
+
+
+def _proven_stale_seconds() -> float:
+    days = _env_float("CHATGPT2API_MAIL_DOMAIN_PROVEN_STALE_DAYS", DEFAULT_PROVEN_STALE_DAYS)
+    return max(1.0, days) * 86400.0
 
 
 def _explore_ratio() -> float:
@@ -268,17 +283,33 @@ def _proven(item: dict[str, Any] | None) -> bool:
 def _should_silent_block(item: dict[str, Any]) -> bool:
     """是否应把该域名按"静默丢信"拉黑。
 
-    - 从未送达过验证码是前提（送达过的域名不会被静默拉黑）；
-    - 连续丢信达到阈值即拉黑；
-    - 历史累计丢信已达阈值时，冷却结束后的第一次丢信立即重新拉黑：坏域名池
-      （实测约 75% 的免费域名）每 24 小时回来一次、每次都要烧掉 80 秒等待，
-      没必要重新取证两次。
+    - 从未送达过验证码：连续丢信达到阈值即拉黑（弱信号需要两次确认）；
+      历史累计丢信已达阈值时，冷却结束后的第一次丢信立即重新拉黑。
+    - **曾经送达过（proven）**：不再永久豁免。实测 483 个 proven 域名里 371 个
+      已经 >7 天没送达，个别域名「成功 1 次、之后连续丢信 600+ 次」仍在被优先
+      选中，是注册成功率掉到 10% 的主因。现在两条降级条件：
+      ① 连续丢信 >= proven 阈值（默认 10；健康域名通常只有 0~3 次）；
+      ② 最后一次送达已超过 STALE_DAYS 天（默认 7）且连续丢信 >= 静默阈值。
+      两者都带冷却，到期会自动半开重试，不会永久封死。
     """
-    if int(item.get("code_received_count") or 0) > 0:
-        return False
     threshold = _silent_threshold()
+    consecutive = int(item.get("consecutive_no_code") or 0)
+    if int(item.get("code_received_count") or 0) > 0:
+        if consecutive >= _proven_threshold():
+            return True
+        last_code = str(item.get("last_code_at") or "").strip()
+        if last_code and consecutive >= threshold:
+            try:
+                when = datetime.fromisoformat(last_code.replace("Z", "+00:00"))
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - when).total_seconds() >= _proven_stale_seconds():
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return False
     return (
-        int(item.get("consecutive_no_code") or 0) >= threshold
+        consecutive >= threshold
         or int(item.get("no_code_count") or 0) >= threshold
     )
 
