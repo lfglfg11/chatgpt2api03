@@ -28,6 +28,8 @@ from services.config import DATA_DIR
 from services.json_file import read_json_file, write_json_file
 from services.proxy_service import proxy_settings
 from services.register import mail_domain_stats
+from services.register import mail_proxy_pool
+from utils.log import logger
 
 DDG_ALIASES_FILE = DATA_DIR / "ddg_aliases.json"
 _ddg_aliases_lock = Lock()
@@ -1682,7 +1684,24 @@ class GptMail2Provider(BaseMailProvider):
         self.entry = dict(entry or {})
         self.api_base = _gptmail2_api_base(entry)
         self.session = _create_session(conf)
+        # 邮箱 API 专用出口池：每个注册任务固定一个出口 IP，429 才换下一个。
+        # OpenAI 注册请求仍走 register.json 顶层 proxy（warp），两者互不影响。
+        self._session_cache: dict[str, Any] = {}
+        self._session_cache_lock = Lock()
         ensure_gptmail2_domain_refresher({"providers": [self.entry], "proxy": str(conf.get("proxy") or "")})
+
+    def _session_for(self, proxy: str):
+        """按出口代理缓存 HTTP 会话，避免每条请求都重建连接。"""
+        if not proxy:
+            return self.session
+        with self._session_cache_lock:
+            session = self._session_cache.get(proxy)
+            if session is None:
+                conf = dict(self.conf)
+                conf["proxy"] = proxy
+                session = _create_session(conf)
+                self._session_cache[proxy] = session
+            return session
 
     def _headers(
         self,
@@ -1711,12 +1730,28 @@ class GptMail2Provider(BaseMailProvider):
         email: str = "",
         gm_sid: str = "",
         token: str = "",
+        mailbox: dict[str, Any] | None = None,
     ) -> Any:
         response_body: Any = None
         resp = None
-        for attempt in range(2):
+        pool_on = mail_proxy_pool.enabled()
+        attempts = 3 if pool_on else 2
+        used: set[str] = set()
+        for attempt in range(attempts):
+            proxy = ""
+            if pool_on:
+                # 优先复用该任务已绑定的出口（同一邮箱始终走同一个 IP），
+                # 该出口被 429 冷却后才换下一个。
+                if isinstance(mailbox, dict):
+                    proxy = str(mailbox.get("proxy") or "").strip()
+                if not proxy or proxy in used:
+                    proxy = mail_proxy_pool.pick(exclude=used)
+                    if proxy and isinstance(mailbox, dict):
+                        mailbox["proxy"] = proxy
+                if proxy:
+                    used.add(proxy)
             browser_session = _gptmail2_browser_session(self.api_base, self.conf, self.entry, force=attempt > 0)
-            resp = self.session.request(
+            resp = self._session_for(proxy).request(
                 method.upper(),
                 f"{self.api_base}{path}",
                 params=params,
@@ -1734,6 +1769,25 @@ class GptMail2Provider(BaseMailProvider):
                 response_body = resp.json()
             except Exception:
                 response_body = resp.text[:300]
+            if resp.status_code == 429 and proxy:
+                # 429 是按出口 IP 计的额度：只冷却这一个出口，立刻换下一个重试，
+                # 并严格按上游给的 retry_after 冷却，不再 0.6 秒后硬打。
+                wait = mail_proxy_pool.cool_down(
+                    proxy,
+                    mail_proxy_pool.retry_after_seconds(response_body),
+                )
+                if isinstance(mailbox, dict):
+                    mailbox.pop("proxy", None)
+                logger.warning({
+                    "event": "mail_proxy_rate_limited",
+                    "provider": self.name,
+                    "path": path,
+                    "cooldown_seconds": round(wait, 1),
+                    "pool": mail_proxy_pool.stats(),
+                })
+                if attempt + 1 < attempts:
+                    continue
+                break
             if attempt == 0 and _gptmail2_needs_browser_verification(resp.status_code, response_body):
                 continue
             break
@@ -1751,6 +1805,8 @@ class GptMail2Provider(BaseMailProvider):
         prefix = (username or _random_mailbox_name()).strip().lower()
         prefix = re.sub(r"[^a-z0-9._-]+", "", prefix) or _random_mailbox_name()
         last_error: Exception | None = None
+        # 该任务绑定的邮箱出口（_request 内部维护：429 时自动换下一个 IP）
+        sticky: dict[str, Any] = {}
         for attempt in range(3):
             # 优先复用历史上真正收到过验证码的域名：免费池里大部分域名会被静默丢信。
             domain = mail_domain_stats.select_domain(self.name, domains)
@@ -1765,6 +1821,7 @@ class GptMail2Provider(BaseMailProvider):
                     payload={"email": email},
                     email=email,
                     gm_sid=gm_sid,
+                    mailbox=sticky,
                 )
             except RuntimeError as error:
                 # 上游对域名/接口限流：记一次短冷却换域名重试，不要浪费整个任务线程。
@@ -1787,7 +1844,7 @@ class GptMail2Provider(BaseMailProvider):
             if not token:
                 raise RuntimeError("GPTMail2 inbox-token 为空")
             real_sid = _gptmail2_jwt_sid(token) or gm_sid
-            return {
+            mailbox: dict[str, Any] = {
                 "provider": self.name,
                 "provider_ref": self.provider_ref,
                 "address": email,
@@ -1796,6 +1853,10 @@ class GptMail2Provider(BaseMailProvider):
                 "api_base": self.api_base,
                 "label": str(self.entry.get("label") or self.name),
             }
+            # 把出口 IP 绑定到该邮箱：后续读信沿用同一个 IP，429 时才换。
+            if sticky.get("proxy"):
+                mailbox["proxy"] = sticky["proxy"]
+            return mailbox
         raise last_error or RuntimeError("GPTMail2 获取 inbox-token 失败")
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
@@ -1804,14 +1865,22 @@ class GptMail2Provider(BaseMailProvider):
         gm_sid = str(mailbox.get("gm_sid") or "").strip()
         if not email or not token:
             return None
-        body = self._request(
-            "GET",
-            "/api/emails",
-            params={"email": email},
-            email=email,
-            gm_sid=gm_sid,
-            token=token,
-        )
+        try:
+            body = self._request(
+                "GET",
+                "/api/emails",
+                params={"email": email},
+                email=email,
+                gm_sid=gm_sid,
+                token=token,
+                mailbox=mailbox,
+            )
+        except RuntimeError as error:
+            # 读信被限流（所有出口都 429）不应判死任务：返回 None 让等待循环继续，
+            # 下一轮会换出口再试。此前一次 429 就直接把任务判死，是 1% 成功率的主因。
+            if mail_domain_stats.is_domain_throttled_error(error):
+                return None
+            raise
         if not isinstance(body, dict):
             return None
         data = body.get("data") if isinstance(body.get("data"), dict) else body
@@ -1841,6 +1910,7 @@ class GptMail2Provider(BaseMailProvider):
                     email=email,
                     gm_sid=gm_sid,
                     token=token,
+                    mailbox=mailbox,
                 )
                 if isinstance(detail_body, dict):
                     if isinstance(detail_body.get("data"), dict):
