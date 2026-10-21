@@ -33,10 +33,12 @@ from services.config import DATA_DIR
 DEFAULT_POOL_FILENAME = "mail_proxy_pool.txt"
 DEFAULT_COOLDOWN_SECONDS = 60.0
 MAX_COOLDOWN_SECONDS = 300.0
+DEFAULT_TRANSPORT_COOLDOWN_SECONDS = 120.0
 
 ENV_ENABLED = "CHATGPT2API_MAIL_PROXY_POOL"
 ENV_POOL_FILE = "CHATGPT2API_MAIL_PROXY_POOL_FILE"
 ENV_COOLDOWN = "CHATGPT2API_MAIL_PROXY_COOLDOWN_SECONDS"
+ENV_TRANSPORT_COOLDOWN = "CHATGPT2API_MAIL_PROXY_TRANSPORT_COOLDOWN_SECONDS"
 
 _RETRY_AFTER_RE = re.compile(r"retry_after['\"]?\s*[:=]\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
 _ALLOWED_SCHEMES = ("socks5://", "socks5h://", "http://", "https://")
@@ -158,6 +160,11 @@ def cool_down(proxy: str, seconds: float | None = None) -> float:
         _cooldown[proxy] = time.monotonic() + wait
         _total_cooldowns += 1
     return wait
+
+
+def transport_cooldown_seconds() -> float:
+    """代理出口 TLS/连接失败时的冷却秒数（默认 120s，避免反复用到坏出口）。"""
+    return _env_float(ENV_TRANSPORT_COOLDOWN, DEFAULT_TRANSPORT_COOLDOWN_SECONDS)
 
 
 def retry_after_seconds(value: Any, default: float | None = None) -> float:

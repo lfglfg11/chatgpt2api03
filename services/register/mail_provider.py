@@ -1743,20 +1743,35 @@ class GptMail2Provider(BaseMailProvider):
             if proxy:
                 used.add(proxy)
             browser_session = _gptmail2_browser_session(self.api_base, self.conf, self.entry, force=attempt > 0)
-            resp = self._session_for(proxy).request(
-                method.upper(),
-                f"{self.api_base}{path}",
-                params=params,
-                json=payload,
-                headers=self._headers(
-                    browser_session=browser_session,
-                    email=email,
-                    gm_sid=gm_sid,
-                    token=token,
-                ),
-                timeout=self.conf["request_timeout"],
-                verify=False,
-            )
+            try:
+                resp = self._session_for(proxy).request(
+                    method.upper(),
+                    f"{self.api_base}{path}",
+                    params=params,
+                    json=payload,
+                    headers=self._headers(
+                        browser_session=browser_session,
+                        email=email,
+                        gm_sid=gm_sid,
+                        token=token,
+                    ),
+                    timeout=self.conf["request_timeout"],
+                    verify=False,
+                )
+            except requests.exceptions.RequestException as exc:
+                # 代理池里个别出口 TLS/连接不通（实测约 1/8 会报
+                # "TLS connect error: ... invalid library"）。这属于出口问题，
+                # 不该判死任务：冷却该出口并立刻换下一个重试。
+                if proxy and attempt + 1 < attempts:
+                    mail_proxy_pool.cool_down(proxy, mail_proxy_pool.transport_cooldown_seconds())
+                    logger.warning({
+                        "event": "mail_proxy_transport_error",
+                        "provider": self.name,
+                        "path": path,
+                        "error": str(exc)[:200],
+                    })
+                    continue
+                raise
             try:
                 response_body = resp.json()
             except Exception:
