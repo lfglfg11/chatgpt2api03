@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-+ [修复] 注册链路的邮箱 429 改为按出口 IP 分流：GPTMail2 的 `429 inbox_rate_limited`（`retry_after: 60`）是**按出口 IP** 计的额度桶（实测：warp 单 IP 8/8 全 429；换一条德国住宅代理 5/5 全 200；同一条代理连续 12/12 全 200）。新增 `services/register/mail_proxy_pool.py`：邮箱 API 走专用代理池（`data/mail_proxy_pool.txt`，每行一条 socks5/http 代理），**OpenAI 注册请求仍走 `register.json` 顶层 proxy 不变**，代理流量只消耗在建邮箱/读信这类小请求上。每个注册任务绑定一个出口 IP，收到 429 时只冷却该出口（按上游 `retry_after`）并换下一个，不再"0.6 秒后换域名硬打同一个 IP"。开关：`CHATGPT2API_MAIL_PROXY_POOL=0` 关闭，`CHATGPT2API_MAIL_PROXY_POOL_FILE` 指定路径。
++ [修复] 注册链路的邮箱 429 改为按出口 IP 分流：GPTMail2 的 `429 inbox_rate_limited`（`retry_after: 60`）是**按出口 IP** 计的额度桶（实测：warp 单 IP 8/8 全 429；换一条德国住宅代理 5/5 全 200；同一条代理连续 12/12 全 200）。新增 `services/register/mail_proxy_pool.py`：邮箱 API 走专用代理池（`data/mail_proxy_pool.txt`，每行一条 socks5/http 代理），**OpenAI 注册请求仍走 `register.json` 顶层 proxy 不变**，代理流量只消耗在建邮箱/读信这类小请求上。每个请求都从池里**轮询均摊**取一个出口（200 条全用上，不做任何固定绑定），收到 429 时只冷却该出口（按上游 `retry_after`）并换下一个，不再"0.6 秒后换域名硬打同一个 IP"。开关：`CHATGPT2API_MAIL_PROXY_POOL=0` 关闭，`CHATGPT2API_MAIL_PROXY_POOL_FILE` 指定路径。
 + [修复] 读验证码邮件时的一次 429 不再判死整个注册任务：`fetch_latest_message` 命中限流时返回 None，让 80 秒等待窗口继续（下一轮自动换出口重试）。此前 60 分钟 4044 个任务里，1358 个已发出 OTP 的任务中只有 48 个走到建号，其余几乎全部死在这一步。
 
 + [修复] 上游会话接口整体故障（`404 {"detail":"Model not found"}`）被误判为账号故障，导致每个请求白烧 4 个账号并把号池 fail 计数打满。新增失败码 `upstream_model_blocked`：`account_fault=False`，既不给账号记失败、也不换账号重试，并按"上游故障"优先上报。取证：2026-10-15 起 `POST /backend-api/conversation` 与 `/backend-api/f/conversation` 对约 96% 账号返回该 404，而同账号的 `/backend-api/me`、`/backend-api/models`、`/backend-api/f/conversation/prepare` 全部 200；换 Accept-Language / OAI-Language / timezone / 出口 IP（WARP 与直连）/ client version / 设备指纹 / model slug（含明显非法 slug）都不改变结果——可用账号对任意 model 名都返回 200，证明该 404 是上游通用拒绝而非模型解析失败。
