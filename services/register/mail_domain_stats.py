@@ -116,6 +116,28 @@ def _explore_min_pool() -> int:
     return max(1, _env_int("CHATGPT2API_MAIL_DOMAIN_EXPLORE_MIN_POOL", DEFAULT_EXPLORE_MIN_POOL))
 
 
+def _hot_hours() -> float:
+    return max(0.0, _env_float("CHATGPT2API_MAIL_DOMAIN_HOT_HOURS", 24.0))
+
+
+def _hot_pool_min() -> int:
+    return max(1, _env_int("CHATGPT2API_MAIL_DOMAIN_HOT_POOL_MIN", 3))
+
+
+def _last_code_age_seconds(item: dict[str, Any] | None) -> float | None:
+    """距上次送达验证码的秒数；从未送达或时间不可解析时返回 None。"""
+    raw = str((item or {}).get("last_code_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        when = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - when).total_seconds())
+
+
 def _throttle_cooldown_seconds() -> float:
     return _env_float("CHATGPT2API_MAIL_DOMAIN_THROTTLE_COOLDOWN_SECONDS", DEFAULT_THROTTLE_COOLDOWN_SECONDS)
 
@@ -382,17 +404,28 @@ def select_domain(provider: str, domains: list[str]) -> str:
     fresh = [domain for domain in available if not is_throttled(domain)]
     source = fresh or available  # 全在冷却期时 fail-open，宁可撞限流也不停摆
     proven: list[str] = []
+    hot: list[str] = []
     unknown: list[str] = []
     risky: list[str] = []
+    hot_seconds = _hot_hours() * 3600
     for domain in source:
         item = items.get(domain)
         if _proven(item):
             proven.append(domain)
+            age = _last_code_age_seconds(item)
+            if age is not None and age <= hot_seconds:
+                hot.append(domain)
         elif int((item or {}).get("consecutive_no_code") or 0) > 0:
             risky.append(domain)
         else:
             unknown.append(domain)
-    if len(proven) >= _proven_pool_min():
+    if len(hot) >= _hot_pool_min():
+        # 最近仍在收信的域名优先：2025 个域名里每天只有 ~36 个真正收到过验证码，
+        # 其余「历史 proven」早已静默丢信，均等抽只会把任务浪费在死域名上。
+        explore_now = random.random() < _explore_ratio() and len(unknown) >= _explore_min_pool()
+        tier = "explore" if explore_now else "hot"
+        candidates = unknown if explore_now else hot
+    elif len(proven) >= _proven_pool_min():
         explore_now = random.random() < _explore_ratio() and len(unknown) >= _explore_min_pool()
         tier = "explore" if explore_now else "proven"
         candidates = unknown if explore_now else proven
@@ -415,6 +448,7 @@ def select_domain(provider: str, domains: list[str]) -> str:
         "available": len(available),
         "throttled": len(available) - len(fresh),
         "proven": len(proven),
+        "hot": len(hot),
         "unknown": len(unknown),
         "risky": len(risky),
     })
