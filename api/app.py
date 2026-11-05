@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import asyncio
 import os
 from threading import Event
 
@@ -16,6 +17,7 @@ from services.account_service import account_service
 from services.backup_service import backup_service
 from services.config import config
 from services.dashboard_metrics_service import dashboard_metrics_service
+from services.freeze_watchdog import freeze_watchdog
 from services.image_service import start_image_cleanup_scheduler
 from services.log_service import cleanup_old_logs, start_log_cleanup_scheduler
 from services.realtime_monitor_service import realtime_monitor_service
@@ -53,6 +55,7 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         _configure_threadpool()
+        freeze_watchdog.start(asyncio.get_running_loop())
         account_service.cleanup_auto_remove_accounts()
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
@@ -75,6 +78,7 @@ def create_app() -> FastAPI:
             yield
         finally:
             stop_event.set()
+            freeze_watchdog.stop()
             thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
             log_cleanup_thread.join(timeout=1)
