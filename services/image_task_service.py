@@ -27,8 +27,10 @@ from services.log_service import (
     log_service,
 )
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from services.protocol.conversation import validate_gif_request
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.diagnostics import exception_diagnostic_fields
+from utils.helper import split_gif_model_suffix
 from utils.timezone import beijing_from_timestamp, beijing_now_str
 
 TASK_STATUS_QUEUED = "queued"
@@ -251,6 +253,9 @@ class ImageTaskService:
         output_format: str | None = None,
         base_url: str = "",
     ) -> dict[str, Any]:
+        model, implied_gif = split_gif_model_suffix(model)
+        output_format = output_format or ("gif" if implied_gif else None)
+        validate_gif_request(model, output_format)
         payload = {
             "prompt": prompt,
             "model": model,
@@ -278,6 +283,9 @@ class ImageTaskService:
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
+        model, implied_gif = split_gif_model_suffix(model)
+        output_format = output_format or ("gif" if implied_gif else None)
+        validate_gif_request(model, output_format)
         payload = {
             "prompt": prompt,
             "images": images or [],

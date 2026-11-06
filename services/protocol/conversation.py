@@ -48,6 +48,7 @@ from utils.helper import (
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
+    split_gif_model_suffix,
     split_image_model,
 )
 from utils.image_tokens import count_image_content_tokens, image_output_metadata, image_size_from_bytes
@@ -87,9 +88,13 @@ def _prompt_option_value(value: object) -> str:
 def validate_gif_request(model: object, output_format: object = None, *, stream: bool = False) -> None:
     """在打上游之前校验输出格式与 GIF 专属约束。"""
     normalized_output_format = normalize_image_output_format(output_format)
+    # `xxx-gif` 别名要按基础模型判断白名单，否则别名永远被拒。
+    base_model, implied_gif = split_gif_model_suffix(model)
+    if normalized_output_format is None and implied_gif and is_supported_image_model(base_model):
+        normalized_output_format = "gif"
     if normalized_output_format != "gif":
         return
-    if str(model or "").strip().lower() not in config.gif_models:
+    if str(base_model or "").strip().lower() not in config.gif_models:
         raise HTTPException(
             status_code=400,
             detail={"error": "GIF output is not enabled for this image model"},
@@ -632,6 +637,21 @@ class ConversationRequest:
     call_id: str = ""
     trace_image_perf: bool = False
     monitor_attempt: int = 0
+
+    def __post_init__(self) -> None:
+        # 模型别名 `xxx-gif` 等价于 `xxx` + `output_format=gif`：只传 model 的客户端也能出 GIF。
+        base_model, implied_gif = split_gif_model_suffix(self.model)
+        if not implied_gif or not is_supported_image_model(base_model):
+            return  # 不是图片模型就原样保留，避免影响文本链路
+        self.model = base_model
+        if self.output_format:
+            return  # 显式传了 output_format 时以显式值为准
+        if str(base_model or "").strip().lower() not in config.gif_models:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "GIF output is not enabled for this image model"},
+            )
+        self.output_format = "gif"
 
 
 @dataclass

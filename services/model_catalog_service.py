@@ -4,7 +4,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.config import config
-from utils.helper import CODEX_IMAGE_MODEL, WEB_IMAGE_MODELS
+from utils.helper import CODEX_IMAGE_MODEL, GIF_MODEL_SUFFIX, WEB_IMAGE_MODELS
 
 
 FALLBACK_CHAT_MODELS = [
@@ -122,6 +122,14 @@ def get_model_catalog() -> dict[str, Any]:
 
     chat_models = _unique(chat_models)
     image_models = _unique(image_models)
+    # 给支持 GIF 的模型追加 `<model>-gif` 别名，前端下拉框选到它就直接出 GIF。
+    gif_aliases = [
+        f"{model}{GIF_MODEL_SUFFIX}"
+        for model in config.gif_models
+        if model in image_models
+    ]
+    if gif_aliases:
+        image_models = _unique([*image_models, *gif_aliases])
     all_models = _unique([*chat_models, *image_models])
 
     return {

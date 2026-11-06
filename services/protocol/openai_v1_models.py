@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from services.account_service import account_service
+from services.config import config
 from services.model_catalog_service import get_model_catalog
 from services.openai_backend_api import OpenAIBackendAPI
-from utils.helper import CODEX_IMAGE_MODEL, WEB_IMAGE_MODELS
+from utils.helper import CODEX_IMAGE_MODEL, GIF_MODEL_SUFFIX, WEB_IMAGE_MODELS
 
 
 def _model_item(model: str) -> dict[str, Any]:
@@ -79,6 +80,13 @@ def _dynamic_image_models() -> list[str]:
     return models
 
 
+def _append_gif_aliases(data: list[Any], seen: set[str]) -> None:
+    """把支持 GIF 的模型额外以 `<model>-gif` 别名暴露，方便只传 model 的客户端。"""
+    for model in config.gif_models:
+        if model in seen:
+            _append_model(data, seen, f"{model}{GIF_MODEL_SUFFIX}")
+
+
 def list_models() -> dict[str, Any]:
     catalog = get_model_catalog()
     data: list[Any] = []
@@ -88,5 +96,6 @@ def list_models() -> dict[str, Any]:
     _append_upstream_models(data, seen)
     _append_models(data, seen, catalog.get("image_models"))
     _append_models(data, seen, _dynamic_image_models())
+    _append_gif_aliases(data, seen)
 
     return {"object": "list", "data": data}

@@ -37,6 +37,9 @@ PREFIXED_CODEX_IMAGE_MODELS = {
 }
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
+# 模型别名后缀：`gpt-image-2.6-gif` 等价于 `gpt-image-2.6` + `output_format=gif`，
+# 用于那些只会传 model、不会传 output_format 的客户端（如多数 chat/completions 客户端）。
+GIF_MODEL_SUFFIX = "-gif"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
@@ -120,10 +123,27 @@ def new_uuid() -> str:
     return str(uuid.uuid4())
 
 
+def split_gif_model_suffix(model: object) -> tuple[str, bool]:
+    """拆出模型名尾部的 `-gif` 别名后缀，返回 (基础模型名, 是否隐含 GIF 输出)。"""
+    normalized = str(model or "").strip()
+    lowered = normalized.lower()
+    if lowered.endswith(GIF_MODEL_SUFFIX) and len(lowered) > len(GIF_MODEL_SUFFIX):
+        return normalized[: -len(GIF_MODEL_SUFFIX)], True
+    return normalized, False
+
+
+def gif_model_alias(model: object) -> str:
+    """给模型名补上 `-gif` 别名后缀（已是别名则原样返回）。"""
+    base_model, _ = split_gif_model_suffix(model)
+    return f"{base_model}{GIF_MODEL_SUFFIX}"
+
+
 def split_image_model(model: object) -> tuple[str | None, str | None]:
     normalized = str(model or "").strip().lower()
     if not normalized:
         return None, None
+    # `xxx-gif` 是输出格式别名，模型本身仍按基础模型识别。
+    normalized, _ = split_gif_model_suffix(normalized)
     if normalized in BASE_IMAGE_MODELS:
         return None, normalized
     for plan_type in IMAGE_MODEL_PLAN_TYPES:
