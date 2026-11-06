@@ -1,4 +1,5 @@
 import base64
+import binascii
 import hashlib
 import json
 import mimetypes
@@ -23,6 +24,9 @@ WEB_IMAGE_MODELS = (
     "gpt-image-2.5",
     "gpt-image-2.5-flare",
     "gpt-image-2.5-sunburst",
+    "gpt-image-2.6",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.6-sunburst",
 )
 BASE_IMAGE_MODELS = {*WEB_IMAGE_MODELS, "codex-gpt-image-2"}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
@@ -707,5 +711,14 @@ def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:
             continue
         b64_json = str(item.get("b64_json") or "").strip()
         if b64_json:
-            markdown_images.append(f"![image_{index}](data:image/png;base64,{b64_json})")
+            mime_type = str(item.get("mime_type") or "").strip() or "image/png"
+            if mime_type == "image/png":
+                # 只解前 8 个 base64 字符（6 字节）判断 GIF 魔数，避免为几 MB 的图再解一遍码。
+                head = b64_json[:8]
+                try:
+                    if base64.b64decode(head + "=" * (-len(head) % 4)).startswith((b"GIF87a", b"GIF89a")):
+                        mime_type = "image/gif"
+                except (ValueError, binascii.Error):
+                    pass
+            markdown_images.append(f"![image_{index}](data:{mime_type};base64,{b64_json})")
     return "\n\n".join(markdown_images) if markdown_images else "Image generation completed."

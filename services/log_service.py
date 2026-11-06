@@ -891,6 +891,7 @@ IMAGE_TRACE_REQUEST_KEYS = {
     "response_format",
     "stream",
     "partial_images",
+    "output_format",
 }
 
 

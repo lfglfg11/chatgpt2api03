@@ -7,6 +7,7 @@ from PIL import Image
 
 from services.image_failure import image_failure
 from services.protocol.conversation import (
+    MISSING_IMAGE_OPTION,
     ConversationRequest,
     ImageGenerationError,
     collect_image_outputs,
@@ -14,6 +15,7 @@ from services.protocol.conversation import (
     encode_images,
     stream_image_chunks,
     stream_image_outputs_with_pool,
+    validate_gif_request,
 )
 from services.image_output import resolve_image_output_base_url, resolve_image_response_format
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
@@ -60,6 +62,10 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
     response_format = resolve_image_response_format(body.get("response_format"))
+    output_format = body.get("output_format")
+    frame_count = body.get("frame_count", MISSING_IMAGE_OPTION)
+    frame_duration_ms = body.get("frame_duration_ms", MISSING_IMAGE_OPTION)
+    validate_gif_request(model, output_format, stream=bool(body.get("stream")))
     base_url = resolve_image_output_base_url(
         body.get("base_url"),
         for_url_response=response_format == "url",
@@ -78,6 +84,9 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         size=size,
         quality=quality,
         response_format=response_format,
+        output_format=str(output_format) if output_format is not None else None,
+        frame_count=frame_count,
+        frame_duration_ms=frame_duration_ms,
         base_url=base_url,
         images=encoded_images,
         message_as_error=True,

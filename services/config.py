@@ -94,6 +94,12 @@ DEFAULT_THIRD_PARTY_APPS = {
     },
 }
 
+DEFAULT_GIF_MODELS = [
+    "gpt-image-2.6",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.6-sunburst",
+]
+
 
 def _normalize_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, str):
@@ -353,6 +359,16 @@ def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
     }
 
 
+def _normalize_gif_models(value: object) -> list[str]:
+    source = value if isinstance(value, list) else DEFAULT_GIF_MODELS
+    normalized: list[str] = []
+    for item in source:
+        model = str(item or "").strip().lower()
+        if model and model not in normalized:
+            normalized.append(model)
+    return normalized
+
+
 def _legacy_basic_from_settings(value: object, settings: dict[str, object]) -> dict[str, object]:
     source = dict(value) if isinstance(value, dict) else {}
     source["proxy"] = str(settings.get("proxy") or "").strip()
@@ -552,6 +568,11 @@ class ConfigStore:
         self.reload_if_changed()
         value = str(self.data.get("image_upscale_engine") or "sharp_lanczos3").strip().lower()
         return value if value in {"sharp_lanczos3", "pillow_lanczos"} else "sharp_lanczos3"
+
+    @property
+    def gif_models(self) -> list[str]:
+        self.reload_if_changed()
+        return _normalize_gif_models(self.data.get("gif_models"))
 
     @property
     def image_auth_refresh_concurrency(self) -> int:
@@ -773,6 +794,8 @@ class ConfigStore:
                 )
             if "third_party_apps" in next_data:
                 next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
+            if "gif_models" in next_data:
+                next_data["gif_models"] = _normalize_gif_models(next_data.get("gif_models"))
             if "proxy_runtime" in next_data:
                 incoming_runtime = next_data.get("proxy_runtime")
                 if isinstance(incoming_runtime, dict):

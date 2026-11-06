@@ -31,6 +31,9 @@ class ImageGenerationRequest(BaseModel):
     response_format: str | None = None
     history_disabled: bool = True
     stream: bool | None = None
+    output_format: str | None = None
+    frame_count: object = None
+    frame_duration_ms: object = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -123,6 +126,11 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        # 未显式传入的可选 GIF 参数必须从 payload 里摘掉，否则下游会当成
+        # "frame_count: null" 写进提示词。
+        for field in ("output_format", "frame_count", "frame_duration_ms"):
+            if field not in body.model_fields_set:
+                payload.pop(field, None)
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         attach_trace_headers(call, request)

@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, Response
 from PIL import Image, ImageOps
 
 from services.config import config
-from services.image_storage_service import image_storage_service
+from services.image_storage_service import image_media_type, image_storage_service
 from services.image_tags_service import load_tags, remove_tags
 from utils.log import logger
 from utils.timezone import beijing_now, parse_to_beijing_naive
@@ -64,8 +64,15 @@ def get_image_response(relative_path: str) -> FileResponse | Response:
         "Access-Control-Allow-Headers": "*",
     }
     if image_storage_service.has_local(relative_path):
-        return FileResponse(_safe_image_path(relative_path), headers=headers)
-    return Response(content=image_storage_service.get_bytes(relative_path), media_type="image/png", headers=headers)
+        rel = _safe_relative_path(relative_path)
+        return FileResponse(
+            _safe_image_path(rel),
+            media_type=image_media_type(rel),
+            headers=headers,
+        )
+    rel = _safe_relative_path(relative_path)
+    payload = image_storage_service.get_bytes(rel)
+    return Response(content=payload, media_type=image_media_type(rel, payload), headers=headers)
 
 
 def _thumbnail_path(relative_path: str) -> Path:
@@ -127,17 +134,19 @@ def get_image_download_response(relative_path: str) -> FileResponse:
         "Access-Control-Allow-Headers": "*",
     }
     if image_storage_service.has_local(relative_path):
-        path = _safe_image_path(relative_path)
+        rel = _safe_relative_path(relative_path)
+        path = _safe_image_path(rel)
         headers = {**cors_headers, "Content-Disposition": f'attachment; filename="{path.name}"'}
-        return FileResponse(path, filename=path.name, headers=headers)
+        return FileResponse(path, filename=path.name, media_type=image_media_type(rel), headers=headers)
     rel = _safe_relative_path(relative_path)
     headers = {
         **cors_headers,
         "Content-Disposition": f'attachment; filename="{Path(rel).name}"',
     }
+    payload = image_storage_service.get_bytes(rel)
     return Response(
-        content=image_storage_service.get_bytes(rel),
-        media_type="image/png",
+        content=payload,
+        media_type=image_media_type(rel, payload),
         headers=headers,
     )
 

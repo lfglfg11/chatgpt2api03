@@ -74,6 +74,9 @@ def _sharp_lanczos3(image_data: bytes, target: tuple[int, int]) -> bytes:
 def upscale_image_if_needed(image_data: bytes, requested_size: object) -> bytes:
     if not image_data or not config.image_upscale_enabled:
         return image_data
+    # GIF 输出必须保持原始字节不变；Pillow/Sharp 会把动图压成单帧位图。
+    if image_data.startswith((b"GIF87a", b"GIF89a")):
+        return image_data
     target = _target_size(requested_size)
     source = image_size_from_bytes(image_data)
     if not target or not source:

@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.image_output import resolve_image_output_base_url, resolve_image_response_format
 from services.protocol.conversation import (
+    MISSING_IMAGE_OPTION,
     ConversationRequest,
     ImageOutput,
     count_message_image_tokens,
@@ -19,6 +20,7 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
     stream_text_deltas,
     text_backend,
+    validate_gif_request,
 )
 from services.protocol.reasoning import thinking_effort_from_body
 from services.protocol.web_search_tool import (
@@ -483,6 +485,10 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         images = None
     input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), model)
     tool = response_image_tool(body)
+    output_format = tool.get("output_format")
+    frame_count = tool.get("frame_count", MISSING_IMAGE_OPTION)
+    frame_duration_ms = tool.get("frame_duration_ms", MISSING_IMAGE_OPTION)
+    validate_gif_request(model, output_format, stream=bool(body.get("stream")))
     response_format = resolve_image_response_format(
         body.get("response_format") or tool.get("output_format") or tool.get("response_format")
     )
@@ -496,6 +502,9 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         size=tool.get("size"),
         quality=str(tool.get("quality") or "auto"),
         response_format=response_format,
+        output_format=str(output_format) if output_format is not None else None,
+        frame_count=frame_count,
+        frame_duration_ms=frame_duration_ms,
         base_url=base_url,
         images=images,
         message_as_error=True,
@@ -506,6 +515,14 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    # 流式 Responses 图片请求必须在返回生成器之前校验，否则 400 会被吞进流里。
+    if body.get("stream") and has_response_image_generation_tool(body):
+        tool = response_image_tool(body)
+        validate_gif_request(
+            str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2",
+            tool.get("output_format"),
+            stream=True,
+        )
     events = response_events(body)
     if body.get("stream"):
         return events
