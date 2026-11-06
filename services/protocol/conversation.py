@@ -504,16 +504,25 @@ def build_image_prompt(
 
 
 def convert_image_bytes(image_data: bytes, output_format: object) -> bytes:
-    """把单张位图转换成请求的非 GIF 格式。"""
+    """把单张位图转换成请求的格式。
+
+    GIF 是唯一会「原样保留」的格式：上游可能同时返回动图 GIF 和一张静图 PNG，
+    动图不能被 Pillow 重新编码（会掉帧），所以真正的 GIF 字节直接透传；
+    但静图必须转成单帧 GIF，否则客户端拿到的文件后缀与 content-type 会和请求不符。
+    """
     normalized_output_format = normalize_image_output_format(output_format)
-    if not normalized_output_format or normalized_output_format == "gif":
+    if not normalized_output_format:
+        return image_data
+    if normalized_output_format == "gif" and image_data.startswith((b"GIF87a", b"GIF89a")):
         return image_data
     try:
         with Image.open(io.BytesIO(image_data)) as source:
             source.seek(0)
             image = ImageOps.exif_transpose(source.copy())
         output = io.BytesIO()
-        if normalized_output_format == "jpeg":
+        if normalized_output_format == "gif":
+            image.convert("P", palette=Image.ADAPTIVE, colors=256).save(output, format="GIF")
+        elif normalized_output_format == "jpeg":
             if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
                 rgba = image.convert("RGBA")
                 background = Image.new("RGB", rgba.size, (255, 255, 255))
