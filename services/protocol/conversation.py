@@ -86,7 +86,13 @@ def _prompt_option_value(value: object) -> str:
 
 
 def validate_gif_request(model: object, output_format: object = None, *, stream: bool = False) -> None:
-    """在打上游之前校验输出格式与 GIF 专属约束。"""
+    """在打上游之前校验输出格式与 GIF 专属约束。
+
+    关于 stream：上游 v3.2.x 直接 400，是因为它的流式链路会把上游的 partial_image（PNG 快照）
+    原样转发，客户端会先看到若干张 PNG 再收到 GIF 终稿。本仓库的 `stream_image_chunks`
+    只发一次 `image_generation.completed`（完整图片），不转发 partial_image，
+    所以 GIF + stream 是安全的，这里不再拦截。
+    """
     normalized_output_format = normalize_image_output_format(output_format)
     # `xxx-gif` 别名要按基础模型判断白名单，否则别名永远被拒。
     base_model, implied_gif = split_gif_model_suffix(model)
@@ -98,11 +104,6 @@ def validate_gif_request(model: object, output_format: object = None, *, stream:
         raise HTTPException(
             status_code=400,
             detail={"error": "GIF output is not enabled for this image model"},
-        )
-    if stream:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "GIF output does not support stream=true"},
         )
 
 
