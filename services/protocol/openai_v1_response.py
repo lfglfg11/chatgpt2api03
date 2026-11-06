@@ -460,6 +460,22 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     return completed
 
 
+# Responses 的 image_generation 工具里，历史上有人把 response_format（url/b64_json）
+# 写进 output_format 字段；这些值不是图片格式，必须忽略，否则会被当成非法格式拒绝。
+_RESPONSE_LEGACY_RESPONSE_FORMATS = {
+    "url", "image_url", "link", "b64_json", "b64", "base64", "base64_json",
+}
+
+
+def _response_output_format(tool: dict[str, Any]) -> str | None:
+    value = tool.get("output_format")
+    if value is None:
+        return None
+    if str(value).strip().lower() in _RESPONSE_LEGACY_RESPONSE_FORMATS:
+        return None
+    return str(value)
+
+
 def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     if is_text_response_request(body):
         model, messages = text_response_parts(body)
@@ -485,7 +501,7 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         images = None
     input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), model)
     tool = response_image_tool(body)
-    output_format = tool.get("output_format")
+    output_format = _response_output_format(tool)
     frame_count = tool.get("frame_count", MISSING_IMAGE_OPTION)
     frame_duration_ms = tool.get("frame_duration_ms", MISSING_IMAGE_OPTION)
     validate_gif_request(model, output_format, stream=bool(body.get("stream")))
@@ -520,7 +536,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         tool = response_image_tool(body)
         validate_gif_request(
             str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2",
-            tool.get("output_format"),
+            _response_output_format(tool),
             stream=True,
         )
     events = response_events(body)
