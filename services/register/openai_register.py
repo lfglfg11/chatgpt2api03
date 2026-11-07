@@ -25,6 +25,46 @@ from utils.timezone import TIME_FORMAT, beijing_now_str
 # 每个注册任务在邮箱域名被 OpenAI 拒绝（unsupported_email）时，允许换邮箱重试的次数。
 MAIL_DOMAIN_RETRY_LIMIT = 2
 
+# registration_disallowed（create_account 阶段"Sorry, we cannot create your account with
+# the given information."）与出口 IP 无关：warp、机房直连、两条德国住宅代理全部同样被拒，
+# 而同一时间段里仍有别的域名注册成功 → 按域名级拒绝处理，换域名重试。
+# 但如果整个域名池都被标记（OpenAI 全局风控），逐个换域名只会把 2000 个域名全部打进
+# 冷却、同时白烧 2000 封 OTP。因此连续 N 次 disallowed 后全局退避一段时间，让线程一起停。
+DISALLOWED_BREAKER_THRESHOLD = 40
+DISALLOWED_BREAKER_PAUSE_SECONDS = 120.0
+
+_breaker_lock = threading.Lock()
+_disallowed_streak = 0
+_pause_until = 0.0
+
+
+def _note_disallowed(reset: bool = False) -> None:
+    """记录一次 registration_disallowed；连续过多时触发全局退避。"""
+    global _disallowed_streak, _pause_until
+    with _breaker_lock:
+        if reset:
+            _disallowed_streak = 0
+            return
+        _disallowed_streak += 1
+        if _disallowed_streak % DISALLOWED_BREAKER_THRESHOLD != 0:
+            return
+        streak = _disallowed_streak
+        _pause_until = time.time() + DISALLOWED_BREAKER_PAUSE_SECONDS
+    log(
+        f"连续 {streak} 次 registration_disallowed，域名池很可能被整体标记，"
+        f"暂停 {int(DISALLOWED_BREAKER_PAUSE_SECONDS)}s 后再试",
+        "yellow",
+    )
+
+
+def _wait_for_pause() -> None:
+    while True:
+        with _breaker_lock:
+            remaining = _pause_until - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 5.0))
+
 
 class EmailDomainRejectedError(RuntimeError):
     """OpenAI 明确拒绝当前邮箱域名（unsupported_email），换域名重试可恢复。"""
@@ -1263,6 +1303,7 @@ def worker(index: int) -> dict:
     start = time.time()
     last_error: Exception | None = None
     for attempt in range(1 + MAIL_DOMAIN_RETRY_LIMIT):
+        _wait_for_pause()
         registrar = PlatformRegistrar(config["proxy"])
         try:
             if attempt:
@@ -1279,10 +1320,13 @@ def worker(index: int) -> dict:
                 stats["done"] += 1
                 stats["success"] += 1
                 avg = (time.time() - stats["start_time"]) / stats["success"]
+            _note_disallowed(reset=True)
             log(f'{result["email"]} 注册成功，本次耗时{cost:.1f}s，全局平均每个号注册耗时{avg:.1f}s', "green")
             return {"ok": True, "index": index, "result": result}
         except EmailDomainRejectedError as e:
             last_error = e
+            if mail_domain_stats.is_registration_disallowed_error(e):
+                _note_disallowed()
             continue
         except Exception as e:
             last_error = e

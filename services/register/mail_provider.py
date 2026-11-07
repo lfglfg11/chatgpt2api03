@@ -3005,6 +3005,10 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
     if address:
         if success:
             mail_domain_stats.record_domain_result(provider_name, address, "accepted")
+        elif mail_domain_stats.is_registration_disallowed_error(error):
+            # create_account 的 registration_disallowed 与出口 IP 无关（warp/机房/住宅
+            # 代理全被拒，同一分钟别的域名能过），按域名级软拒绝记短冷却，让任务换域名重试。
+            mail_domain_stats.record_domain_result(provider_name, address, "disallowed", error)
         elif mail_domain_stats.is_domain_rejected_error(error):
             mail_domain_stats.record_domain_result(provider_name, address, "rejected", error)
         elif mail_domain_stats.is_code_missing_error(error):

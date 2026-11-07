@@ -51,11 +51,24 @@ DEFAULT_EXPLORE_RATIO = 0.15
 DEFAULT_EXPLORE_MIN_POOL = 3
 # 域名被上游邮箱服务限流（GPTMail2 inbox_request_rate_limited）后的冷却时长。
 DEFAULT_THROTTLE_COOLDOWN_SECONDS = 120.0
+# create_account 阶段的 registration_disallowed（"Sorry, we cannot create your account
+# with the given information."）实测与出口 IP 无关：warp(Cloudflare)、机房直连、
+# 两条德国住宅代理全部同样被拒，而同一时间段里仍有别的域名注册成功 → 属于域名级
+# 拒绝，应当换域名重试。旧行为把它当普通异常，1694 次任务原地失败、一次都没换域名。
+# 但它也可能是全局风控，所以冷却期远短于 unsupported_email（6h），误判也不会把
+# 整个域名池一次性封死。
+DEFAULT_DISALLOWED_COOLDOWN_MINUTES = 30.0
 _DOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 _UNSUPPORTED_MARKERS = ("unsupported_email", "the email you provided is not supported")
+# registration_disallowed 是 create_account 阶段的软拒绝：同一分钟内别的域名能过，
+# 所以按"域名级拒绝、换域名重试"处理，但用独立的短冷却（见 DEFAULT_DISALLOWED_COOLDOWN_MINUTES）。
+_REGISTRATION_DISALLOWED_MARKERS = (
+    "registration_disallowed",
+    "we cannot create your account with the given information",
+)
 _CODE_MISSING_MARKERS = ("等待注册验证码超时", "等待 microsoft 登录验证码超时", "验证码超时")
 _THROTTLE_MARKERS = ("inbox_request_rate_limited", "too many inbox requests", "http 429")
-_OUTCOMES = frozenset({"accepted", "rejected", "neutral", "delivered", "no_code", "throttled"})
+_OUTCOMES = frozenset({"accepted", "rejected", "neutral", "delivered", "no_code", "throttled", "disallowed"})
 _lock = threading.RLock()
 
 
@@ -93,6 +106,12 @@ def _cooldown_seconds() -> float:
 
 def _silent_cooldown_seconds() -> float:
     return _env_float("CHATGPT2API_MAIL_DOMAIN_SILENT_COOLDOWN_HOURS", DEFAULT_SILENT_BLOCK_COOLDOWN_HOURS) * 3600.0
+
+
+def _disallowed_cooldown_seconds() -> float:
+    return _env_float(
+        "CHATGPT2API_MAIL_DOMAIN_DISALLOWED_COOLDOWN_MINUTES", DEFAULT_DISALLOWED_COOLDOWN_MINUTES
+    ) * 60.0
 
 
 def _proven_pool_min() -> int:
@@ -157,10 +176,18 @@ def normalize_domain(value: object) -> str:
     return text
 
 
-def is_domain_rejected_error(error: object) -> bool:
-    """识别 OpenAI 明确的邮箱域名拒绝信号（unsupported_email）。"""
+def is_registration_disallowed_error(error: object) -> bool:
+    """识别 create_account 阶段的 registration_disallowed（域名级软拒绝）。"""
     text = str(error or "").lower()
-    return any(marker in text for marker in _UNSUPPORTED_MARKERS)
+    return any(marker in text for marker in _REGISTRATION_DISALLOWED_MARKERS)
+
+
+def is_domain_rejected_error(error: object) -> bool:
+    """识别 OpenAI 明确的邮箱域名拒绝信号（unsupported_email / registration_disallowed）。"""
+    text = str(error or "").lower()
+    if any(marker in text for marker in _UNSUPPORTED_MARKERS):
+        return True
+    return is_registration_disallowed_error(text)
 
 
 def is_code_missing_error(error: object) -> bool:
@@ -198,6 +225,8 @@ def _default_item(domain: str) -> dict[str, Any]:
         "last_error": "",
         "blocked_at": "",
         "silent_blocked_at": "",
+        "disallowed_at": "",
+        "disallowed_count": 0,
         "throttled_at": "",
         "throttle_count": 0,
     }
@@ -287,6 +316,14 @@ def _unblock_expired_unlocked(items: dict[str, dict[str, Any]]) -> bool:
                 item["last_error"] = f"silent-cooldown-expired@{_now_iso()}"
                 changed = True
                 logger.info({"event": "mail_domain_silent_cooldown_expired", "domain": item["domain"]})
+        disallowed_at = str(item.get("disallowed_at") or "")
+        if disallowed_at:
+            expired = _expired(disallowed_at, _disallowed_cooldown_seconds(), now)
+            if expired is not False:
+                item["disallowed_at"] = ""
+                item["last_error"] = f"disallowed-cooldown-expired@{_now_iso()}"
+                changed = True
+                logger.info({"event": "mail_domain_disallowed_cooldown_expired", "domain": item["domain"]})
     return changed
 
 
@@ -294,6 +331,7 @@ def _is_blocked(item: dict[str, Any]) -> bool:
     return bool(
         item.get("blocked_at")
         or item.get("silent_blocked_at")
+        or item.get("disallowed_at")
         or int(item.get("consecutive_rejections") or 0) >= _threshold()
     )
 
@@ -461,6 +499,7 @@ def record_domain_result(provider: str, email_or_domain: object, outcome: str, e
     outcome:
     - accepted：注册成功（正向，清零各类连续失败计数）
     - rejected：unsupported_email 等确定性拒绝（硬信号，按阈值拉黑）
+    - disallowed：create_account 的 registration_disallowed（域名级软拒绝，短冷却）
     - delivered：成功收到验证码（强正向，进入 proven 池）
     - no_code：等待验证码超时（弱负向，连续多次且从未收到过验证码才拉黑）
     - neutral：与域名无关的失败，不计数
@@ -471,6 +510,7 @@ def record_domain_result(provider: str, email_or_domain: object, outcome: str, e
         return {"matched": False, "blocked": False}
     newly_blocked = False
     newly_silent_blocked = False
+    newly_disallowed = False
     with _lock:
         items = _load_unlocked()
         item = items.setdefault(domain, _default_item(domain))
@@ -482,6 +522,7 @@ def record_domain_result(provider: str, email_or_domain: object, outcome: str, e
             item["last_code_at"] = _now_iso()
             item["last_error"] = ""
             item["silent_blocked_at"] = ""
+            item["disallowed_at"] = ""
         elif action == "no_code":
             item["no_code_count"] = int(item.get("no_code_count") or 0) + 1
             item["consecutive_no_code"] = int(item.get("consecutive_no_code") or 0) + 1
@@ -503,6 +544,13 @@ def record_domain_result(provider: str, email_or_domain: object, outcome: str, e
             item["last_error"] = ""
             item["blocked_at"] = ""
             item["silent_blocked_at"] = ""
+            item["disallowed_at"] = ""
+        elif action == "disallowed":
+            # create_account 被 registration_disallowed 拒绝：域名级软拒绝，短冷却。
+            item["disallowed_at"] = _now_iso()
+            item["disallowed_count"] = int(item.get("disallowed_count") or 0) + 1
+            item["last_error"] = str(error or "")[:200]
+            newly_disallowed = True
         elif action == "rejected":
             item["total_rejections"] = int(item.get("total_rejections") or 0) + 1
             item["consecutive_rejections"] = int(item.get("consecutive_rejections") or 0) + 1
@@ -529,12 +577,22 @@ def record_domain_result(provider: str, email_or_domain: object, outcome: str, e
             "consecutive_no_code": item["consecutive_no_code"],
             "code_received_count": int(item.get("code_received_count") or 0),
         })
+    if newly_disallowed:
+        logger.warning({
+            "event": "mail_domain_disallowed",
+            "provider": str(provider or ""),
+            "domain": domain,
+            "disallowed_count": int(item.get("disallowed_count") or 0),
+            "cooldown_minutes": round(_disallowed_cooldown_seconds() / 60.0, 1),
+            "error": str(error or "")[:200],
+        })
     return {
         "matched": True,
         "domain": domain,
         "blocked": _is_blocked(item),
         "newly_blocked": newly_blocked,
         "newly_silent_blocked": newly_silent_blocked,
+        "newly_disallowed": newly_disallowed,
         "consecutive_rejections": int(item.get("consecutive_rejections") or 0),
         "consecutive_no_code": int(item.get("consecutive_no_code") or 0),
         "code_received_count": int(item.get("code_received_count") or 0),
@@ -597,6 +655,7 @@ def stats_snapshot() -> dict[str, Any]:
                     if int(entry.get("no_code_count") or 0) > 0 and int(entry.get("code_received_count") or 0) == 0
                 ),
                 "throttled": throttled,
+                "disallowed": sum(1 for entry in entries if entry.get("disallowed_at")),
             },
             "items": entries,
             "updated_at": _now_iso(),
@@ -616,6 +675,7 @@ def reset_domain(domain_value: object) -> dict[str, Any]:
         item["consecutive_no_code"] = 0
         item["blocked_at"] = ""
         item["silent_blocked_at"] = ""
+        item["disallowed_at"] = ""
         item["last_error"] = ""
         _save_unlocked(items)
     return {"ok": True, "domain": domain}
