@@ -60,8 +60,9 @@ class FreezeWatchdog:
             "CHATGPT2API_FREEZE_WATCHDOG_EXIT", True)
         self.dump_dir = dump_dir or _DUMP_DIR
         # 线程池饱和阈值：事件循环还活着、但所有 worker 线程都被卡住时，
-        # 心跳仍然是通的（_ping 只是 sleep(0)），所以必须额外盯线程数 + 令牌数。
-        self.thread_threshold = _env_int("CHATGPT2API_FREEZE_WATCHDOG_THREADS", 150, 20)
+        # 心跳仍然是通的（_ping 只是 sleep(0)），所以必须额外向线程池要 worker 来探活。
+        # 线程数只作为二次确认，避免「瞬时高并发但池子还有余量」被误判成假死。
+        self.thread_threshold = _env_int("CHATGPT2API_FREEZE_WATCHDOG_THREADS", 180, 20)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._consecutive_failures = 0
@@ -101,19 +102,15 @@ class FreezeWatchdog:
         await asyncio.sleep(0)
 
     @staticmethod
-    def _threadpool_saturated() -> tuple[bool, int, int]:
-        """返回 (是否饱和, 当前线程数, 剩余线程池令牌数)。
+    async def _threadpool_ping() -> None:
+        """向默认线程池要一个 worker：拿得到说明还有余量，拿不到说明池子已经饱和。
 
-        事件循环活着但所有 worker 线程都卡在锁/等待上时，心跳是通的，
-        只有线程数和 anyio 令牌数能暴露问题。
+        不能直接读 `current_default_thread_limiter()`：它是 ContextVar，看门狗线程
+        有自己的上下文，读到的会是一个新建的 40 令牌限流器（假象）。
         """
-        try:
-            from anyio.to_thread import current_default_thread_limiter
+        import anyio.to_thread
 
-            available = int(current_default_thread_limiter().available_tokens)
-        except Exception:
-            available = -1
-        return available <= 0, threading.active_count(), available
+        await anyio.to_thread.run_sync(lambda: None)
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
@@ -135,16 +132,24 @@ class FreezeWatchdog:
                 continue
             self._consecutive_failures = 0
 
-            saturated, threads, available = self._threadpool_saturated()
-            if saturated and threads >= self.thread_threshold:
+            # 心跳通不代表服务可用：所有 worker 线程被占满时，事件循环照样能跑 sleep(0)。
+            try:
+                probe = asyncio.run_coroutine_threadsafe(self._threadpool_ping(), loop)
+                probe.result(timeout=self.interval)
+            except Exception as exc:
                 self._consecutive_saturated += 1
+                threads = threading.active_count()
                 logger.warning({
                     "event": "freeze_watchdog_threadpool_saturated",
                     "consecutive_failures": self._consecutive_saturated,
                     "threads": threads,
-                    "available_tokens": available,
+                    "error": f"{type(exc).__name__}: {exc}",
                 })
-                if self._consecutive_saturated >= self.failures and not self._dumped:
+                if (
+                    self._consecutive_saturated >= self.failures
+                    and threads >= self.thread_threshold
+                    and not self._dumped
+                ):
                     self._handle_freeze("threadpool_saturated")
             else:
                 self._consecutive_saturated = 0
@@ -166,7 +171,11 @@ class FreezeWatchdog:
             dump_path = f"dump_failed: {type(exc).__name__}: {exc}"
         try:
             logger.error({
-                "event": "freeze_watchdog_event_loop_blocked",
+                "event": (
+                    "freeze_watchdog_threadpool_exhausted"
+                    if reason == "threadpool_saturated"
+                    else "freeze_watchdog_event_loop_blocked"
+                ),
                 "reason": reason,
                 "blocked_seconds": blocked_seconds,
                 "dump_path": dump_path,
