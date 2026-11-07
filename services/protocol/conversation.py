@@ -1934,6 +1934,38 @@ def stream_image_outputs(
         return
 
     if is_text_reply and conversation_id and not file_ids and not sediment_ids:
+        # 上游有时不在图片工具里出图，而是让代码解释器在 sandbox 里画图，正文只回
+        # `[下载](sandbox:/mnt/data/xxx.gif)` 这种文本卡片。这种结果没有 asset_pointer，
+        # 会被判成「上游只回了文字」，但文件其实就在 sandbox 里，能直接取回来。
+        sandbox_urls: list[str] = []
+        try:
+            sandbox_urls = backend.resolve_sandbox_image_urls(conversation_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning({
+                "event": "image_sandbox_rescue_failed",
+                "conversation_id": conversation_id,
+                "error": diagnostic_excerpt(repr(exc), 300),
+            })
+        if sandbox_urls:
+            rescued = _image_result_output_from_urls(
+                backend,
+                request,
+                conversation_id,
+                sandbox_urls,
+                index,
+                total,
+                path="sandbox",
+            )
+            if rescued is not None:
+                logger.info({
+                    "event": "image_sandbox_rescued",
+                    "call_id": request.call_id,
+                    "conversation_id": conversation_id,
+                    "url_count": len(sandbox_urls),
+                })
+                yield rescued
+                return
+
         task_failure, task_error = _get_detailed_failure_from_tasks(
             backend,
             conversation_id,

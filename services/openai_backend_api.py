@@ -102,6 +102,12 @@ EDITABLE_PPT_MIME_TYPES = {
 }
 EDITABLE_PSD_EXPORT_FILE_RE = re.compile(r"(?:sandbox:)?(/mnt/data/[^\s\"'\)\]]+\.(?:psd|zip))", re.IGNORECASE)
 EDITABLE_PPT_EXPORT_FILE_RE = re.compile(r"(?:sandbox:)?(/mnt/data/[^\s\"'\)\]]+\.(?:pptx?|zip))", re.IGNORECASE)
+# 代码解释器沙箱里产出的图片：上游有时不用图片工具，而是在 sandbox 里画图，
+# 回复正文只给一个 `[下载](sandbox:/mnt/data/xxx.gif)` 文本卡片。
+IMAGE_SANDBOX_EXPORT_FILE_RE = re.compile(
+    r"(?:sandbox:)?(/mnt/data/[^\s\"'\)\]]+\.(?:gif|png|jpe?g|webp))",
+    re.IGNORECASE,
+)
 FILE_SERVICE_ID_RE = re.compile(r"file-service://([A-Za-z0-9_-]+)")
 FILE_ID_RE = re.compile(r"\b(file[-_](?!service\b)[A-Za-z0-9_-]+)\b")
 # 真正的图片文件 ID 格式：file_00000000 + 24位十六进制字符（共32字符）
@@ -1962,6 +1968,57 @@ class OpenAIBackendAPI:
                 if url:
                     return url
         return ""
+
+    def resolve_sandbox_image_urls(self, conversation_id: str, limit: int = 4) -> list[str]:
+        """从会话里捞出「代码解释器沙箱产出的图片」并解析成可下载 URL。
+
+        上游有时不用图片工具，而是在 sandbox 里用 matplotlib 之类的库画图，正文只回一个
+        `[下载高清 GIF 动画](sandbox:/mnt/data/xxx.gif)` 文本卡片。这种结果没有
+        image_asset_pointer，按原来的两条路径都匹配不上，会被判成 upstream_text_reply。
+        这里复用 editable 产物那套「解析 sandbox_path -> interpreter/download」的能力。
+        """
+        if not conversation_id:
+            return []
+        try:
+            conversation = self._get_conversation(conversation_id, timeout_secs=30)
+        except Exception as exc:
+            logger.warning({
+                "event": "image_sandbox_conversation_failed",
+                "conversation_id": conversation_id,
+                "error": diagnostic_excerpt(repr(exc), 300),
+            })
+            return []
+        try:
+            artifacts = self._extract_editable_artifacts(conversation, IMAGE_SANDBOX_EXPORT_FILE_RE)
+        except Exception as exc:
+            logger.warning({
+                "event": "image_sandbox_extract_failed",
+                "conversation_id": conversation_id,
+                "error": diagnostic_excerpt(repr(exc), 300),
+            })
+            return []
+        urls: list[str] = []
+        for artifact in artifacts[-max(1, int(limit)):]:
+            try:
+                url = self._resolve_editable_download_url(conversation_id, artifact)
+            except Exception as exc:
+                logger.warning({
+                    "event": "image_sandbox_url_failed",
+                    "conversation_id": conversation_id,
+                    "sandbox_path": artifact.sandbox_path,
+                    "error": diagnostic_excerpt(repr(exc), 300),
+                })
+                url = ""
+            if url:
+                urls.append(url)
+        logger.info({
+            "event": "image_sandbox_artifacts_resolved",
+            "conversation_id": conversation_id,
+            "artifact_count": len(artifacts),
+            "url_count": len(urls),
+            "sandbox_paths": [item.sandbox_path for item in artifacts[-max(1, int(limit)):]],
+        })
+        return urls
 
     def _editable_download_headers(self, path: str, conversation_id: str, route: str) -> Dict[str, str]:
         headers = self._editable_browser_headers(path, conversation_id)

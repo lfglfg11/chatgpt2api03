@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -8,6 +9,28 @@ from typing import Any
 from curl_cffi.requests import exceptions as curl_exceptions
 
 from utils.helper import UpstreamHTTPError
+
+# 上游有时把结果做成了聊天卡片（`<badge>…</badge>`、`<row>`、`[下载](sandbox:/mnt/data/x.gif)`），
+# 失败时这段 DSL 会被当作「上游文字」原样透给前端，用户看到的就是一堆 XML。
+_UI_DSL_TAG_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9_-]*(?:\s[^<>]*)?/?>")
+_SANDBOX_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]*)\]\(\s*sandbox:[^)]*\)", re.IGNORECASE)
+_SANDBOX_PATH_RE = re.compile(r"sandbox:\S+", re.IGNORECASE)
+_UPSTREAM_TEXT_FALLBACK = "上游这次只回了文字说明，没有产出图片。可以重试一次，或把要求写得更具体（例如指定尺寸、帧数）。"
+
+
+def clean_upstream_text_reply(text: Any, limit: int = 300) -> str:
+    """把上游「文字回复」里的 UI DSL 洗成人话，洗空了就给一句可读的提示。"""
+    raw = str(text or "")
+    if not raw.strip():
+        return _UPSTREAM_TEXT_FALLBACK
+    cleaned = _SANDBOX_MARKDOWN_LINK_RE.sub(lambda match: match.group(1), raw)
+    cleaned = _SANDBOX_PATH_RE.sub("", cleaned)
+    cleaned = _UI_DSL_TAG_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"[ \t\r\f\v]+", " ", cleaned)
+    cleaned = re.sub(r"\n{2,}", "\n", cleaned).strip()
+    if not cleaned:
+        return _UPSTREAM_TEXT_FALLBACK
+    return cleaned[:limit].strip() or _UPSTREAM_TEXT_FALLBACK
 
 
 @dataclass(frozen=True)
@@ -387,6 +410,8 @@ def public_image_error_message(
 
     upstream_text = _public_upstream_text(failure, error)
     if upstream_text:
+        if failure.code == "upstream_text_reply":
+            upstream_text = clean_upstream_text_reply(upstream_text)
         return upstream_text
 
     if failure.code in _TOOL_ERROR_PUBLIC_CODES:
