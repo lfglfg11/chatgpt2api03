@@ -14,6 +14,7 @@ from utils.helper import UpstreamHTTPError
 # 失败时这段 DSL 会被当作「上游文字」原样透给前端，用户看到的就是一堆 XML。
 _UI_DSL_TAG_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9_-]*(?:\s[^<>]*)?/?>")
 _SANDBOX_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]*)\]\(\s*sandbox:[^)]*\)", re.IGNORECASE)
+_GENUI_OPEN_URL_RE = re.compile(r"GenUI\.[A-Za-z_]+\(\s*\"([^\"]*)\"\s*\)", re.IGNORECASE)
 _SANDBOX_PATH_RE = re.compile(r"sandbox:\S+", re.IGNORECASE)
 _UPSTREAM_TEXT_FALLBACK = "上游这次只回了文字说明，没有产出图片。可以重试一次，或把要求写得更具体（例如指定尺寸、帧数）。"
 
@@ -24,6 +25,10 @@ def clean_upstream_text_reply(text: Any, limit: int = 300) -> str:
     if not raw.strip():
         return _UPSTREAM_TEXT_FALLBACK
     cleaned = _SANDBOX_MARKDOWN_LINK_RE.sub(lambda match: match.group(1), raw)
+    cleaned = _GENUI_OPEN_URL_RE.sub(
+        lambda match: "" if match.group(1).lower().startswith("sandbox:") else match.group(1),
+        cleaned,
+    )
     cleaned = _SANDBOX_PATH_RE.sub("", cleaned)
     cleaned = _UI_DSL_TAG_RE.sub(" ", cleaned)
     cleaned = re.sub(r"[ \t\r\f\v]+", " ", cleaned)

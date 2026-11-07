@@ -3320,6 +3320,9 @@ class OpenAIBackendAPI:
                 )
             except ImagePollTimeoutError as exc:
                 if not file_ids and not sediment_ids:
+                    sandbox_urls = self.resolve_sandbox_image_urls(conversation_id)
+                    if sandbox_urls:
+                        return sandbox_urls
                     raise
                 logger.warning({
                     "event": "image_resolve_poll_partial_timeout",
@@ -3329,6 +3332,11 @@ class OpenAIBackendAPI:
                 })
             except Exception as exc:
                 if not file_ids and not sediment_ids:
+                    # 上游让代码解释器在 sandbox 里画图时，正文只有一段文本卡片，
+                    # 轮询永远拿不到 file_ids，这里先把沙箱里的图片捞出来。
+                    sandbox_urls = self.resolve_sandbox_image_urls(conversation_id)
+                    if sandbox_urls:
+                        return sandbox_urls
                     raise
                 failure = classify_image_exception(exc)
                 if failure.capability == "auth":
