@@ -59,9 +59,13 @@ class FreezeWatchdog:
         self.exit_on_freeze = exit_on_freeze if exit_on_freeze is not None else _env_flag(
             "CHATGPT2API_FREEZE_WATCHDOG_EXIT", True)
         self.dump_dir = dump_dir or _DUMP_DIR
+        # 线程池饱和阈值：事件循环还活着、但所有 worker 线程都被卡住时，
+        # 心跳仍然是通的（_ping 只是 sleep(0)），所以必须额外盯线程数 + 令牌数。
+        self.thread_threshold = _env_int("CHATGPT2API_FREEZE_WATCHDOG_THREADS", 150, 20)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._consecutive_failures = 0
+        self._consecutive_saturated = 0
         self._dumped = False
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -96,6 +100,21 @@ class FreezeWatchdog:
     async def _ping() -> None:
         await asyncio.sleep(0)
 
+    @staticmethod
+    def _threadpool_saturated() -> tuple[bool, int, int]:
+        """返回 (是否饱和, 当前线程数, 剩余线程池令牌数)。
+
+        事件循环活着但所有 worker 线程都卡在锁/等待上时，心跳是通的，
+        只有线程数和 anyio 令牌数能暴露问题。
+        """
+        try:
+            from anyio.to_thread import current_default_thread_limiter
+
+            available = int(current_default_thread_limiter().available_tokens)
+        except Exception:
+            available = -1
+        return available <= 0, threading.active_count(), available
+
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
             loop = self._loop
@@ -112,11 +131,25 @@ class FreezeWatchdog:
                     "error": f"{type(exc).__name__}: {exc}",
                 })
                 if self._consecutive_failures >= self.failures and not self._dumped:
-                    self._handle_freeze()
+                    self._handle_freeze("event_loop_blocked")
                 continue
             self._consecutive_failures = 0
 
-    def _handle_freeze(self) -> None:
+            saturated, threads, available = self._threadpool_saturated()
+            if saturated and threads >= self.thread_threshold:
+                self._consecutive_saturated += 1
+                logger.warning({
+                    "event": "freeze_watchdog_threadpool_saturated",
+                    "consecutive_failures": self._consecutive_saturated,
+                    "threads": threads,
+                    "available_tokens": available,
+                })
+                if self._consecutive_saturated >= self.failures and not self._dumped:
+                    self._handle_freeze("threadpool_saturated")
+            else:
+                self._consecutive_saturated = 0
+
+    def _handle_freeze(self, reason: str = "event_loop_blocked") -> None:
         self._dumped = True
         blocked_seconds = round(self.interval * self.failures, 1)
         dump_path = ""
@@ -125,8 +158,8 @@ class FreezeWatchdog:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             target = self.dump_dir / f"freeze-{stamp}.log"
             with open(target, "w", encoding="utf-8") as fp:
-                fp.write(f"# event loop unresponsive for >= {blocked_seconds}s at {stamp}\n")
-                fp.write(f"# pid={os.getpid()}\n\n")
+                fp.write(f"# {reason} for >= {blocked_seconds}s at {stamp}\n")
+                fp.write(f"# pid={os.getpid()} threads={threading.active_count()}\n\n")
                 faulthandler.dump_traceback(file=fp, all_threads=True)
             dump_path = str(target)
         except Exception as exc:
@@ -134,6 +167,7 @@ class FreezeWatchdog:
         try:
             logger.error({
                 "event": "freeze_watchdog_event_loop_blocked",
+                "reason": reason,
                 "blocked_seconds": blocked_seconds,
                 "dump_path": dump_path,
                 "action": "exit" if self.exit_on_freeze else "log_only",

@@ -38,6 +38,10 @@ INTERNAL_RESPONSE_KEYS = {
     "_image_metadata",
 }
 
+# 跟随者等待「同 key 的 owner 算完」的最长时间。超时后自己算一遍，
+# 而不是无限 wait —— 无限等待会把线程池 token 永久占住（2026-11-07 事故）。
+INFLIGHT_WAIT_SECONDS = 60.0
+
 
 @dataclass
 class CacheEntry:
@@ -207,29 +211,51 @@ class ChatCompletionCache:
 
         now = time.time()
         max_entries = int(settings.get("max_entries") or 1)
+        cached: Any = None
         with self._lock:
             self._prune_locked(now, max_entries)
             entry = self._entries.get(key)
             if entry and entry.expires_at > now:
-                yield from self._copy(entry.value)
-                return
-            inflight = self._inflight.get(key) if settings.get("dedupe_inflight") else None
-            if inflight is None:
-                inflight = InflightCall()
-                if settings.get("dedupe_inflight"):
-                    self._inflight[key] = inflight
-                owner = True
-            else:
+                cached = self._copy(entry.value)
+                inflight = None
                 owner = False
+            else:
+                inflight = self._inflight.get(key) if settings.get("dedupe_inflight") else None
+                if inflight is None:
+                    inflight = InflightCall()
+                    if settings.get("dedupe_inflight"):
+                        self._inflight[key] = inflight
+                    owner = True
+                else:
+                    owner = False
+
+        # 命中缓存必须在锁外 yield：生成器在这里挂起（客户端读得慢、或连接已断）时，
+        # 若仍持有 self._lock，所有其它流式请求都会卡在 `with self._lock` 上，
+        # 线程池被逐步占满，最终整站不可用（2026-11-07 事故根因）。
+        if cached is not None:
+            yield from cached
+            return
 
         if not owner:
+            deadline = time.time() + INFLIGHT_WAIT_SECONDS
             with inflight.condition:
                 while not inflight.done:
-                    inflight.condition.wait()
-                if inflight.error:
-                    raise inflight.error
-                yield from self._copy(inflight.value)
-                return
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    inflight.condition.wait(remaining)
+                finished = inflight.done
+                shared_value = self._copy(inflight.value) if finished else None
+                shared_error = inflight.error if finished else None
+            if finished:
+                if shared_error:
+                    raise shared_error
+                if shared_value is not None:
+                    yield from shared_value
+                    return
+            # 等待超时：不再无限等下去（否则线程被永久占住），退化为自己算一遍。
+            yield from compute()
+            return
 
         chunks: list[dict[str, Any]] = []
         try:

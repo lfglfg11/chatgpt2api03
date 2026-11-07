@@ -22,6 +22,10 @@ from utils.helper import anonymize_token
 
 _RemoteCheckMarker = tuple[str, str, str, bool | None, str, str]
 
+# 等待「某个图片账号空出并发名额」的最长时间。单张图通常 30~60s 出结果，
+# 给 120s 足够；再等下去只会把线程池 token 永久占住，把整站拖死。
+IMAGE_SLOT_WAIT_SECONDS = 120.0
+
 
 
 class ImageAccountSelectionError(RuntimeError):
@@ -1109,6 +1113,9 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> str:
+        # 所有账号都忙时不能无限等：无限等待会让线程永久占住线程池 token，
+        # 最终把整站拖死（2026-11-07 事故）。超时后抛可重试错误，由调用方换路。
+        deadline = time.time() + IMAGE_SLOT_WAIT_SECONDS
         with self._image_slot_condition:
             while True:
                 # Token refresh can rotate an attempted account's access token while
@@ -1142,6 +1149,12 @@ class AccountService:
                     self._index += 1
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
+                if time.time() >= deadline:
+                    raise ImageAccountSelectionError(
+                        "unavailable",
+                        "all image accounts stayed busy longer than "
+                        f"{IMAGE_SLOT_WAIT_SECONDS:.0f}s, please retry later",
+                    )
                 self._image_slot_condition.wait(timeout=1.0)
 
     def _no_ready_candidate_error(
