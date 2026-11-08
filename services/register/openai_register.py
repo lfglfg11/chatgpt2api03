@@ -1316,6 +1316,13 @@ class PlatformRegistrar:
                 except RuntimeError as error:
                     if "user_already_exists" not in str(error):
                         raise
+                    if str(mailbox.get("provider") or "") == "mail22":
+                        # 22.do 的 outlook/hotmail 箱是「共享 base 账号 + plus 别名」，
+                        # OpenAI 归一化后认为 base 已注册；这类账号登录验证码也不会下发，
+                        # 所以不要浪费 60s+180s 去走登录兜底，直接换邮箱重试。
+                        raise RuntimeError(
+                            "该邮箱在 OpenAI 已有账号（user_already_exists），22.do 共享 base 账号不可用于新注册"
+                        ) from error
                     # passwordless 校验通过时 OpenAI 往往已经把账号建好了，
                     # 此时 create_account 会返回 user_already_exists；先直接取 OAuth code 换 token，
                     # 拿不到再退回 passwordless 登录（需要再收一封登录验证码）。
