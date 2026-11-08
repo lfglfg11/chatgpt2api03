@@ -3152,6 +3152,7 @@ class Mail22Provider(BaseMailProvider):
             address = self._create_from_pool(domain, pool_type)
         uuid_value = secrets.token_hex(16)
         token, expire_at = self._apply_token(address, uuid_value)
+        logger.info(f"22.do 建箱成功 {address} uuid={uuid_value}")
         return {
             "provider": self.name,
             "provider_ref": self.provider_ref,
@@ -3204,6 +3205,14 @@ class Mail22Provider(BaseMailProvider):
         if not raw:
             return []
         raw.sort(key=lambda item: _mail22_epoch(item.get("time")), reverse=True)
+        logger.info(
+            f"22.do {address} 收件箱 {len(raw)} 封 ["
+            + ", ".join(
+                f"{str(item.get('messageId') or item.get('message_id') or item.get('id') or '')[:14]}@{_mail22_epoch(item.get('time'))}"
+                for item in raw[:5]
+            )
+            + "]"
+        )
         messages: list[dict[str, Any]] = []
         for item in raw[: max(1, limit)]:
             message_id = str(item.get("messageId") or item.get("message_id") or item.get("id") or "").strip()
@@ -3254,8 +3263,16 @@ class Mail22Provider(BaseMailProvider):
             mailbox["_seen_code_message_refs"] = seen_value
         seen_refs = {str(item) for item in seen_value}
         deadline = time.monotonic() + self.conf["wait_timeout"]
+        polls = 0
         while time.monotonic() < deadline:
-            for message in self.fetch_recent_messages(mailbox, limit=3):
+            polls += 1
+            messages = self.fetch_recent_messages(mailbox, limit=3)
+            if polls == 1 or polls % 10 == 0:
+                logger.info(
+                    f"22.do 等待验证码 {mailbox.get('address')} 轮询#{polls} 邮件数={len(messages)}"
+                    + (f" 正文错误={messages[0].get('body_error')}" if messages and messages[0].get("body_error") else "")
+                )
+            for message in messages:
                 if _message_before_code_boundary(mailbox, message):
                     continue
                 ref = _message_tracking_ref(message)
