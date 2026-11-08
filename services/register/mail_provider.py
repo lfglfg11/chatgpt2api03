@@ -1398,16 +1398,24 @@ def _gptmail2_refresh_browser_session(api_base: str, conf: dict, entry: dict | N
         fallback_options = dict(options)
         fallback_options.pop("geoip", None)
         variants.append(fallback_options)
-    browser_factory = None
     last_error: Exception | None = None
     for variant in variants:
         try:
-            browser_factory = Camoufox(**variant)
-            break
-        except Exception as exc:  # noqa: BLE001 - 回退到下一个参数组合
+            return _gptmail2_collect_browser_session(api_base, hostname, timeout_ms, variant)
+        except Exception as exc:  # noqa: BLE001 - geoip 缺失时回退重试
             last_error = exc
-    if browser_factory is None:
-        raise RuntimeError(f"Camoufox 启动失败: {last_error}")
+            if "geoip" not in str(exc).lower() or "geoip" not in variant:
+                raise
+    raise last_error if last_error is not None else RuntimeError("GPTMail2 浏览器验证失败")
+
+
+def _gptmail2_collect_browser_session(
+    api_base: str,
+    hostname: str,
+    timeout_ms: int,
+    options: dict[str, Any],
+) -> dict[str, str]:
+    browser_factory = Camoufox(**options)
     with browser_factory as browser:
         page = browser.new_page()
         page.goto(f"{api_base}/zh/", wait_until="domcontentloaded", timeout=max(timeout_ms, 60_000))

@@ -59,6 +59,10 @@ def _launch_camoufox(options: dict[str, Any]):
     raise last_error if last_error is not None else RuntimeError("Camoufox 启动失败")
 
 
+def _is_geoip_error(exc: Exception) -> bool:
+    return "geoip" in str(exc).lower()
+
+
 def create_session(api_base: str, proxy_value: str = "") -> dict[str, str]:
     options: dict[str, Any] = {"headless": False}
     proxy = _camoufox_proxy(proxy_value)
@@ -68,6 +72,24 @@ def create_session(api_base: str, proxy_value: str = "") -> dict[str, str]:
         options["geoip"] = True
     hostname = (urlparse(api_base).hostname or "").lower()
 
+    variants = [dict(options)]
+    if "geoip" in variants[0]:
+        fallback = dict(options)
+        fallback.pop("geoip", None)
+        variants.append(fallback)
+
+    last_error: Exception | None = None
+    for variant in variants:
+        try:
+            return _collect_verified_cookie(api_base, hostname, variant)
+        except Exception as exc:  # noqa: BLE001 - geoip 缺失时回退重试
+            last_error = exc
+            if not _is_geoip_error(exc) or "geoip" not in variant:
+                raise
+    raise last_error if last_error is not None else RuntimeError("Camoufox 启动失败")
+
+
+def _collect_verified_cookie(api_base: str, hostname: str, options: dict[str, Any]) -> dict[str, str]:
     browser_factory = _launch_camoufox(options)
 
     with browser_factory as browser:
