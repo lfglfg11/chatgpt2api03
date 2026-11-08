@@ -2894,6 +2894,392 @@ class OutlookTokenProvider(BaseMailProvider):
         return None
 
 
+# ---------------------------------------------------------------------------
+# 22.do 临时邮箱（https://22.do）
+# 纯 JSON API、无签名，但 Cloudflare 只放行带浏览器 TLS 指纹且走 HTTP/2 的客户端：
+# 普通 requests / curl（HTTP/1.1）一律 403，curl_cffi(impersonate="chrome") 才返回 200。
+# ---------------------------------------------------------------------------
+
+MAIL22_DEFAULT_API_BASE = "https://22.do"
+MAIL22_OWN_DOMAINS = [
+    "linshiyou.com",
+    "colabeta.com",
+    "youxiang.dev",
+    "colaname.com",
+    "usdtbeta.com",
+    "tnbeta.com",
+    "fft.edu.do",
+]
+MAIL22_POOL_DOMAINS: dict[str, tuple[str, ...]] = {
+    "gmail": ("gmail.com", "googlemail.com"),
+    "microsoft": ("outlook.com", "hotmail.com"),
+}
+MAIL22_RESERVED_ACCOUNTS = frozenset(
+    {
+        "admin",
+        "root",
+        "fuck",
+        "webmaster",
+        "idiot",
+        "support",
+        "mail",
+        "postmaster",
+        "www",
+        "master",
+        "about",
+        "noreply",
+    }
+)
+MAIL22_ACCOUNT_MIN = 3
+MAIL22_ACCOUNT_MAX = 28
+MAIL22_TOKEN_REFRESH_MARGIN = 300
+
+
+def _mail22_api_base(entry: dict) -> str:
+    value = str(entry.get("api_base") or "").strip()
+    return (value or MAIL22_DEFAULT_API_BASE).rstrip("/")
+
+
+def _mail22_domain_type(domain: str) -> str:
+    value = str(domain or "").strip().lower()
+    if value in MAIL22_OWN_DOMAINS:
+        return "domain"
+    for pool, domains in MAIL22_POOL_DOMAINS.items():
+        if value in domains:
+            return pool
+    return "domain"
+
+
+def _mail22_make_account(username: str | None) -> str:
+    candidate = re.sub(r"[^A-Za-z0-9]", "", str(username or ""))[:MAIL22_ACCOUNT_MAX]
+    if MAIL22_ACCOUNT_MIN <= len(candidate) and candidate.lower() not in MAIL22_RESERVED_ACCOUNTS:
+        return candidate
+    alphabet = string.ascii_lowercase + string.digits
+    for _ in range(24):
+        value = "".join(random.choices(alphabet, k=10))
+        if value not in MAIL22_RESERVED_ACCOUNTS:
+            return value
+    return "".join(random.choices(string.ascii_lowercase, k=12))
+
+
+def _mail22_jwt_expire(token: str) -> int:
+    try:
+        payload = str(token or "").split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")))
+        return int(float(data.get("exp") or 0))
+    except Exception:
+        return 0
+
+
+def _mail22_epoch(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    if text.isdigit():
+        return float(text)
+    parsed = _parse_received_at(text)
+    return parsed.timestamp() if parsed else 0.0
+
+
+def _mail22_html_to_text(html: str) -> str:
+    text = re.sub(r"<script\b[\s\S]*?</script>", " ", str(html or ""), flags=re.I)
+    text = re.sub(r"<style\b[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<!--[\s\S]*?-->", " ", text)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</(?:p|div|tr|li|h[1-6]|table)\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    for raw, repl in (
+        ("&nbsp;", " "),
+        ("&amp;", "&"),
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", '"'),
+        ("&#39;", "'"),
+    ):
+        text = text.replace(raw, repl)
+    text = re.sub(r"[ \t\u00a0]+", " ", text)
+    return re.sub(r"\n\s*\n+", "\n", text).strip()
+
+
+def _mail22_looks_html(value: str) -> bool:
+    return bool(re.search(r"<(?:html|body|div|p|table|span)\b", str(value or "")[:4000], re.I))
+
+
+class Mail22Provider(BaseMailProvider):
+    """22.do 临时邮箱：自有域精确建箱 + 随机池筛选，JWT 取信，正文走 content→view 两段式。"""
+
+    name = "mail22"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = _mail22_api_base(entry)
+        self.language = str(entry.get("language") or "zh").strip() or "zh"
+        self.domains = _normalize_string_list(entry.get("domain")) or list(MAIL22_OWN_DOMAINS)
+        try:
+            self.max_tries = max(1, int(entry.get("max_tries") or 20))
+        except Exception:
+            self.max_tries = 20
+        self.session = _create_session(conf)
+        self.session.headers.update(
+            {
+                "Accept": "application/json, text/plain, */*",
+                "Origin": self.api_base,
+                "Referer": f"{self.api_base}/{self.language}/",
+            }
+        )
+
+    # ---- HTTP ----------------------------------------------------------
+    def _post(self, path: str, payload: dict | None = None, token: str = "") -> dict:
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        resp = self.session.post(
+            f"{self.api_base}{path}",
+            json=payload or {},
+            headers=headers,
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        if resp.status_code == 403:
+            raise RuntimeError(f"22.do 403：出口被 Cloudflare 拦截（需 HTTP/2 + 浏览器指纹）: POST {path}")
+        if resp.status_code != 200:
+            raise RuntimeError(f"22.do 请求失败: POST {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
+        try:
+            data = resp.json()
+        except Exception as error:
+            raise RuntimeError(f"22.do 返回非 JSON: POST {path}, body={resp.text[:200]}") from error
+        if isinstance(data, dict) and data.get("status") is False:
+            raise RuntimeError(f"22.do 拒绝: POST {path}, msg={data.get('msg') or data.get('message') or '未知'}")
+        return data if isinstance(data, dict) else {}
+
+    def _cookie_header(self, mailbox: dict[str, Any]) -> str:
+        parts = [f"email={str(mailbox.get('address') or '').strip()}"]
+        expire = mailbox.get("mail22_expire")
+        if expire:
+            parts.append(f"expireTime={int(expire)}")
+        return "; ".join(parts)
+
+    def _get_text(self, path: str, mailbox: dict[str, Any]) -> str:
+        resp = self.session.get(
+            f"{self.api_base}{path}",
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Cookie": self._cookie_header(mailbox),
+            },
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"22.do 页面请求失败: GET {path}, HTTP {resp.status_code}")
+        return resp.text
+
+    # ---- token ---------------------------------------------------------
+    def _apply_token(self, address: str, uuid_value: str) -> tuple[str, int]:
+        data = self._post("/action/mailbox/applyToken", {"email": address, "uuid": uuid_value})
+        payload = data.get("data") or {}
+        token = str(payload.get("token") or "").strip()
+        if not token:
+            raise RuntimeError(f"22.do applyToken 未返回 token: {address}")
+        expire = payload.get("expireTime") or _mail22_jwt_expire(token)
+        try:
+            expire_at = int(float(expire))
+        except Exception:
+            expire_at = int(time.time()) + 3600
+        return token, expire_at
+
+    def _ensure_token(self, mailbox: dict[str, Any], *, force: bool = False) -> str:
+        token = str(mailbox.get("mail22_token") or "").strip()
+        expire_at = int(mailbox.get("mail22_expire") or 0)
+        if token and not force and expire_at > time.time() + MAIL22_TOKEN_REFRESH_MARGIN:
+            return token
+        address = str(mailbox.get("address") or "").strip()
+        if not address:
+            raise RuntimeError("22.do 邮箱缺少 address")
+        uuid_value = str(mailbox.get("mail22_uuid") or "").strip() or secrets.token_hex(16)
+        token, expire_at = self._apply_token(address, uuid_value)
+        mailbox["mail22_uuid"] = uuid_value
+        mailbox["mail22_token"] = token
+        mailbox["mail22_expire"] = expire_at
+        return token
+
+    # ---- 建箱 -----------------------------------------------------------
+    def _pick_domain(self) -> str:
+        try:
+            selected = str(mail_domain_stats.select_domain(self.name, self.domains) or "").strip()
+        except Exception as error:
+            logger.warning(f"22.do 选域失败，回退轮转: {error}")
+            selected = ""
+        return selected or _next_domain(self.domains)
+
+    def _match_pool(self, address: str, want_domain: str, want_type: str) -> bool:
+        domain = str(address or "").rsplit("@", 1)[-1].lower()
+        if want_type == "domain":
+            return domain == str(want_domain or "").strip().lower()
+        return domain in MAIL22_POOL_DOMAINS.get(want_type, ())
+
+    def _create_from_pool(self, want_domain: str, want_type: str) -> str:
+        data = self._post("/action/mailbox/create", {"language": self.language, "uuid": secrets.token_hex(16)})
+        address = str((data.get("data") or {}).get("email") or "").strip()
+        if not address:
+            raise RuntimeError("22.do create 未返回邮箱")
+        tries = 1
+        while tries < self.max_tries and not self._match_pool(address, want_domain, want_type):
+            changed = self._post("/action/mailbox/change", {"email": address})
+            address = str((changed.get("data") or {}).get("email") or "").strip()
+            if not address:
+                raise RuntimeError("22.do change 未返回新邮箱")
+            tries += 1
+        if not self._match_pool(address, want_domain, want_type):
+            raise RuntimeError(f"22.do 重试 {tries} 次仍未拿到 {want_type}/{want_domain} 邮箱（当前 {address}）")
+        return address
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        domain = self._pick_domain()
+        pool_type = _mail22_domain_type(domain)
+        if pool_type == "domain":
+            account = _mail22_make_account(username)
+            data = self._post("/action/mailbox/account", {"email": f"{account}@{domain}"})
+            address = str((data.get("data") or {}).get("email") or "").strip()
+            if not address:
+                raise RuntimeError(f"22.do 建箱失败：{account}@{domain} 未返回邮箱")
+            actual = address.rsplit("@", 1)[-1].lower()
+            if actual != domain.lower():
+                raise RuntimeError(f"22.do 建箱域名不符：请求 {domain}，返回 {address}")
+        else:
+            address = self._create_from_pool(domain, pool_type)
+        uuid_value = secrets.token_hex(16)
+        token, expire_at = self._apply_token(address, uuid_value)
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "domain": address.rsplit("@", 1)[-1].lower(),
+            "mail22_uuid": uuid_value,
+            "mail22_token": token,
+            "mail22_expire": expire_at,
+        }
+
+    # ---- 取信 -----------------------------------------------------------
+    def _read_body(self, mailbox: dict[str, Any], message_id: str) -> tuple[str, str]:
+        page = self._get_text(f"/{self.language}/content/{message_id}", mailbox)
+        match = re.search(r"/view/([A-Za-z0-9_\-]+)", page)
+        if not match:
+            # 没拿到 viewId 说明 content 页被重定向（messageId 失效 / Cookie 不匹配），
+            # 此时页面正文是站点首页，不能当邮件内容用，否则会误抓首页上的数字。
+            raise RuntimeError(f"22.do 未在 content 页找到 viewId（messageId={message_id}）")
+        body = self._get_text(f"/view/{match.group(1)}", mailbox)
+        if _mail22_looks_html(body):
+            return _mail22_html_to_text(body), body
+        return body.strip(), ""
+
+    def _cached_body(self, mailbox: dict[str, Any], message_id: str) -> tuple[str, str] | None:
+        cache = mailbox.get("_mail22_body_cache")
+        if not isinstance(cache, dict):
+            cache = {}
+            mailbox["_mail22_body_cache"] = cache
+        hit = cache.get(message_id)
+        if isinstance(hit, (list, tuple)) and len(hit) == 2:
+            return str(hit[0]), str(hit[1])
+        return None
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any], limit: int = 3) -> list[dict[str, Any]]:
+        address = str(mailbox.get("address") or "").strip()
+        if not address:
+            raise RuntimeError("22.do 邮箱缺少 address")
+        # 始终取全量：lastime 水位一旦推进，正文读取失败的邮件就再也拿不回来了
+        lastime = 0
+        token = self._ensure_token(mailbox)
+        try:
+            data = self._post("/action/mailbox/message", {"email": address, "lastime": lastime}, token)
+        except RuntimeError as error:
+            if "HTTP 401" not in str(error) and "HTTP 403" not in str(error):
+                raise
+            token = self._ensure_token(mailbox, force=True)
+            data = self._post("/action/mailbox/message", {"email": address, "lastime": lastime}, token)
+        items = data.get("data")
+        raw = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        if not raw:
+            return []
+        raw.sort(key=lambda item: _mail22_epoch(item.get("time")), reverse=True)
+        messages: list[dict[str, Any]] = []
+        for item in raw[: max(1, limit)]:
+            message_id = str(item.get("messageId") or item.get("message_id") or item.get("id") or "").strip()
+            text_content = ""
+            html_content = ""
+            body_error = ""
+            if message_id:
+                cached = self._cached_body(mailbox, message_id)
+                if cached is not None:
+                    text_content, html_content = cached
+                else:
+                    try:
+                        text_content, html_content = self._read_body(mailbox, message_id)
+                    except Exception as error:
+                        body_error = str(error)
+                        logger.warning(f"22.do 正文读取失败 {message_id}: {error}")
+                    if not body_error:
+                        cache = mailbox.setdefault("_mail22_body_cache", {})
+                        if isinstance(cache, dict):
+                            cache[message_id] = [text_content, html_content]
+                            while len(cache) > 20:
+                                cache.pop(next(iter(cache)))
+            epoch = _mail22_epoch(item.get("time"))
+            messages.append(
+                {
+                    "provider": self.name,
+                    "mailbox": address,
+                    "message_id": message_id,
+                    "subject": str(item.get("subject") or item.get("title") or "").strip(),
+                    "sender": str(item.get("from") or item.get("sender") or "").strip(),
+                    "text_content": text_content,
+                    "html_content": html_content,
+                    "body_error": body_error,
+                    "received_at": datetime.fromtimestamp(epoch, tz=timezone.utc) if epoch else _parse_received_at(item.get("time")),
+                    "raw": item,
+                }
+            )
+        return messages
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox, limit=1)
+        return messages[0] if messages else None
+
+    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
+        if not isinstance(seen_value, list):
+            seen_value = []
+            mailbox["_seen_code_message_refs"] = seen_value
+        seen_refs = {str(item) for item in seen_value}
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        while time.monotonic() < deadline:
+            for message in self.fetch_recent_messages(mailbox, limit=3):
+                if _message_before_code_boundary(mailbox, message):
+                    continue
+                ref = _message_tracking_ref(message)
+                if ref in seen_refs:
+                    continue
+                code = _extract_code(message)
+                if code:
+                    seen_value.append(ref)
+                    seen_refs.add(ref)
+                    return code
+                if message.get("body_error"):
+                    # 正文没读到，先不记入已读，下一轮重新拉取
+                    continue
+                seen_refs.add(ref)
+            time.sleep(max(0.2, self.conf["wait_interval"]))
+        return None
+
+    def close(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+
 def _entries(mail_config: dict) -> list[dict]:
     result: list[dict] = []
     counters: dict[str, int] = {}
@@ -2955,6 +3341,8 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return YydsMailProvider(entry, conf)
     if entry["type"] == "outlook_token":
         return OutlookTokenProvider(entry, conf)
+    if entry["type"] in {"mail22", "mail_22", "22do", "22_do"}:
+        return Mail22Provider(entry, conf)
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 

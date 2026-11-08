@@ -44,6 +44,7 @@ export const providerTypeOptions = [
   { value: 'donemail', label: 'DoneMail' },
   { value: 'yyds_mail', label: 'YYDS Mail' },
   { value: 'ddg_mail', label: 'DDG + CF 收件箱' },
+  { value: 'mail22', label: '22.do 邮箱' },
   { value: 'outlook_token', label: 'Microsoft 邮箱凭据池' },
 ]
 
@@ -104,6 +105,7 @@ export const providerTypeKeys: Record<string, string[]> = {
   donemail: ['api_base', 'admin_key', 'domain', 'email_prefix', 'message_limit'],
   yyds_mail: ['api_base', 'api_key', 'domain', 'subdomain', 'wildcard'],
   ddg_mail: ['api_base', 'ddg_token', 'cf_inbox_jwt', 'admin_password', 'cf_api_key', 'cf_auth_mode', 'cf_create_path', 'cf_messages_path'],
+  mail22: ['api_base', 'domain'],
   outlook_token: ['mailboxes', 'mode', 'imap_host', 'message_limit', 'alias_enabled', 'alias_per_email', 'alias_prefix', 'alias_include_original'],
 }
 
@@ -187,6 +189,20 @@ export function defaultProvider(type = 'cloudmail_gen'): RegisterProvider {
         cf_auth_mode: 'none',
         cf_create_path: '/api/new_address',
         cf_messages_path: '/api/mails',
+      }
+    case 'mail22':
+      return {
+        ...base,
+        api_base: 'https://22.do',
+        domain: [
+          'linshiyou.com',
+          'colabeta.com',
+          'youxiang.dev',
+          'colaname.com',
+          'usdtbeta.com',
+          'tnbeta.com',
+          'fft.edu.do',
+        ],
       }
     case 'outlook_token':
       return {
@@ -481,7 +497,7 @@ export function providerRequirementMessages(provider: RegisterProvider) {
 }
 
 export function providerUsesApiBase(provider: RegisterProvider) {
-  return ['cloudmail_gen', 'cloudflare_temp_email', 'moemail', 'inbucket', 'yyds_mail', 'ddg_mail', 'donemail', 'gptmail2'].includes(providerType(provider))
+  return ['cloudmail_gen', 'cloudflare_temp_email', 'moemail', 'inbucket', 'yyds_mail', 'ddg_mail', 'donemail', 'gptmail2', 'mail22'].includes(providerType(provider))
 }
 
 export function providerUsesApiKey(provider: RegisterProvider) {
@@ -497,7 +513,7 @@ export function providerUsesDefaultDomain(provider: RegisterProvider) {
 }
 
 export function providerUsesDomainList(provider: RegisterProvider) {
-  return ['cloudmail_gen', 'tempmail_lol', 'cloudflare_temp_email', 'moemail', 'inbucket', 'yyds_mail', 'donemail'].includes(providerType(provider))
+  return ['cloudmail_gen', 'tempmail_lol', 'cloudflare_temp_email', 'moemail', 'inbucket', 'yyds_mail', 'donemail', 'mail22'].includes(providerType(provider))
 }
 
 export function apiBaseLabel(provider: RegisterProvider) {
@@ -506,6 +522,7 @@ export function apiBaseLabel(provider: RegisterProvider) {
   if (type === 'ddg_mail') return 'CF API Base'
   if (type === 'donemail') return 'DoneMail URL'
   if (type === 'gptmail2') return 'GPTMail2 API Base'
+  if (type === 'mail22') return '22.do Base'
   return 'API Base'
 }
 
@@ -533,6 +550,7 @@ export function domainPlaceholder(provider: RegisterProvider) {
   if (type === 'tempmail_lol') return '每行一个域名，可留空使用服务默认'
   if (type === 'yyds_mail') return '每行一个域名，可留空'
   if (type === 'donemail') return '每行一个 DoneMail 已接收域名'
+  if (type === 'mail22') return '每行一个域名：linshiyou.com 等自有域可精确建箱；gmail.com / outlook.com 走随机池筛选'
   return '每行一个域名'
 }
 
