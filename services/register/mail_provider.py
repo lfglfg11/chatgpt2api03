@@ -1388,10 +1388,17 @@ def _gptmail2_refresh_browser_session(api_base: str, conf: dict, entry: dict | N
     proxy = _gptmail2_camoufox_proxy(str(conf.get("proxy") or ""))
     if proxy:
         options["proxy"] = proxy
+        # Camoufox 在使用代理时未声明 geoip 会抛 LeakWarning 并中断启动
+        options["geoip"] = True
 
     hostname = (urlparse(api_base).hostname or "").lower()
     timeout_ms = max(10_000, int(float(conf.get("request_timeout") or 30) * 1000))
-    with Camoufox(**options) as browser:
+    try:
+        browser_factory = Camoufox(**options)
+    except TypeError:
+        options.pop("geoip", None)
+        browser_factory = Camoufox(**options)
+    with browser_factory as browser:
         page = browser.new_page()
         page.goto(f"{api_base}/zh/", wait_until="domcontentloaded", timeout=max(timeout_ms, 60_000))
         for _ in range(60):
