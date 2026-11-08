@@ -1000,7 +1000,7 @@ class PlatformRegistrar:
         return code == "invalid_state" or "sign-in session is no longer valid" in message
 
     def _passwordless_login(self, email: str, mailbox: dict, index: int) -> dict:
-        if str(mailbox.get("provider") or "") != "outlook_token":
+        if str(mailbox.get("provider") or "") not in {"outlook_token", "mail22"}:
             raise RuntimeError("OpenAI 返回登录流，当前邮箱来源无法读取 Microsoft 登录验证码")
         step(index, "OpenAI 返回登录流，转入 Microsoft passwordless 登录", "yellow")
         for attempt in range(2):
@@ -1292,8 +1292,16 @@ class PlatformRegistrar:
                 mail_provider.mark_mailbox_code_received(mailbox)
                 step(index, f"收到注册验证码: {code}")
                 self._validate_otp(code, index)
-                self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
-                tokens = self._exchange_registered_tokens(index)
+                try:
+                    self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+                    tokens = self._exchange_registered_tokens(index)
+                except RuntimeError as error:
+                    if "user_already_exists" not in str(error):
+                        raise
+                    # passwordless 校验通过时 OpenAI 往往已经把账号建好了，
+                    # 此时 create_account 会返回 user_already_exists；改走登录换 token。
+                    step(index, "账号已存在（passwordless 校验阶段已创建），改走登录换取 token", "yellow")
+                    tokens = self._passwordless_login(email, mailbox, index)
         except Exception as error:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise
