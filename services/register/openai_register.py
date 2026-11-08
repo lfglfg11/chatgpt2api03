@@ -1273,6 +1273,16 @@ class PlatformRegistrar:
                 if not self.passwordless_signup:
                     mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
                     self._start_passwordless_signup(index)
+                else:
+                    # authorize 落到 email-verification 只说明进入了 passwordless 页面，
+                    # 不代表 OpenAI 已经发出验证码；不显式触发 send-otp 会一直等到超时。
+                    try:
+                        self._start_passwordless_signup(index)
+                        step(index, "已补发 passwordless 验证码")
+                    except EmailDomainRejectedError:
+                        raise
+                    except Exception as error:  # noqa: BLE001
+                        step(index, f"补发验证码失败（继续等待授权阶段的邮件）: {error}", "yellow")
                 step(index, "已进入 passwordless signup，不创建本地不可用的随机密码")
                 step(index, "开始等待注册验证码")
                 code = wait_for_code(mailbox, register_proxy=self.proxy)
