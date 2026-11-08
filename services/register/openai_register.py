@@ -1317,9 +1317,24 @@ class PlatformRegistrar:
                     if "user_already_exists" not in str(error):
                         raise
                     # passwordless 校验通过时 OpenAI 往往已经把账号建好了，
-                    # 此时 create_account 会返回 user_already_exists；改走登录换 token。
-                    step(index, "账号已存在（passwordless 校验阶段已创建），改走登录换取 token", "yellow")
-                    tokens = self._passwordless_login(email, mailbox, index)
+                    # 此时 create_account 会返回 user_already_exists；先直接取 OAuth code 换 token，
+                    # 拿不到再退回 passwordless 登录（需要再收一封登录验证码）。
+                    step(index, "账号已存在（passwordless 校验阶段已创建），改为直接取 OAuth code 换 token", "yellow")
+                    exchange_errors: list[str] = []
+                    tokens = exchange_tokens_from_continue_url(
+                        self.session,
+                        self.device_id,
+                        self.code_verifier,
+                        f"{auth_base}/sign-in-with-chatgpt/platform/consent",
+                        self.proxy,
+                        self.clearance_user_agent,
+                        exchange_errors,
+                        self.fingerprint,
+                    )
+                    if not tokens:
+                        reason = "；".join(exchange_errors[-2:]) or "未返回 token"
+                        step(index, f"直接换 token 失败（{reason}），退回 passwordless 登录", "yellow")
+                        tokens = self._passwordless_login(email, mailbox, index)
                     token_email = _jwt_email(tokens.get("id_token") or "")
                     if token_email and token_email != email.strip().lower():
                         raise RuntimeError(f"账号归属不匹配: token={token_email} 目标={email}")
