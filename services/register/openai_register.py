@@ -1333,7 +1333,8 @@ class PlatformRegistrar:
                     )
                     if not tokens:
                         reason = "；".join(exchange_errors[-2:]) or "未返回 token"
-                        step(index, f"直接换 token 失败（{reason}），退回 passwordless 登录", "yellow")
+                        step(index, f"直接换 token 失败（{reason}），等 60s 后走 passwordless 登录（避免 OTP 重发被限流）", "yellow")
+                        time.sleep(60)
                         tokens = self._passwordless_login(email, mailbox, index)
                     token_email = _jwt_email(tokens.get("id_token") or "")
                     if token_email and token_email != email.strip().lower():
