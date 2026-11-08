@@ -571,6 +571,24 @@ def _absolute_auth_url(url: str) -> str:
     return value
 
 
+def _jwt_email(token: str) -> str:
+    """从 id_token 的 payload 里取 email 声明，仅用于校验账号归属（不验签）。"""
+    parts = str(token or "").split(".")
+    if len(parts) < 2:
+        return ""
+    payload = parts[1]
+    pad = 4 - len(payload) % 4
+    if pad != 4:
+        payload += "=" * pad
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("email") or "").strip().lower()
+
+
 def _safe_url_for_log(url: str) -> str:
     value = str(url or "").strip()
     if not value:
@@ -1302,6 +1320,9 @@ class PlatformRegistrar:
                     # 此时 create_account 会返回 user_already_exists；改走登录换 token。
                     step(index, "账号已存在（passwordless 校验阶段已创建），改走登录换取 token", "yellow")
                     tokens = self._passwordless_login(email, mailbox, index)
+                    token_email = _jwt_email(tokens.get("id_token") or "")
+                    if token_email and token_email != email.strip().lower():
+                        raise RuntimeError(f"账号归属不匹配: token={token_email} 目标={email}")
         except Exception as error:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise
