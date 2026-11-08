@@ -22,6 +22,10 @@ def _camoufox_proxy(value: str) -> dict[str, str] | None:
     parsed = urlparse(value if "://" in value else f"http://{value}")
     if not parsed.hostname:
         raise RuntimeError("代理地址无效")
+    # Firefox 不支持带认证的 SOCKS5 代理，直接退回直连
+    if (parsed.scheme or "").startswith("socks") and (parsed.username or parsed.password):
+        print("socks5 auth proxy not supported by firefox, using direct connection", file=sys.stderr)
+        return None
     proxy = {"server": f"{parsed.scheme or 'http'}://{parsed.hostname}"}
     if parsed.port:
         proxy["server"] += f":{parsed.port}"

@@ -1298,6 +1298,15 @@ def _gptmail2_camoufox_proxy(proxy_value: str) -> dict[str, str] | None:
     parsed = urlparse(value if "://" in value else f"http://{value}")
     if not parsed.hostname:
         raise RuntimeError("GPTMail2 浏览器验证的代理地址无效")
+    # Firefox 不支持带认证的 SOCKS5 代理（BrowserType.launch 会直接失败），
+    # 这种情况退回直连取 clearance Cookie，业务请求仍走原代理。
+    if (parsed.scheme or "").startswith("socks") and (parsed.username or parsed.password):
+        logger.warning({
+            "event": "gptmail2_browser_proxy_skipped",
+            "reason": "socks5_auth_unsupported_by_firefox",
+            "proxy": f"{parsed.hostname}:{parsed.port or ''}",
+        })
+        return None
     result = {"server": f"{parsed.scheme or 'http'}://{parsed.hostname}"}
     if parsed.port:
         result["server"] += f":{parsed.port}"
