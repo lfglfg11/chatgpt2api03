@@ -40,22 +40,35 @@ def _input() -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def create_session(api_base: str, proxy_value: str = "") -> dict[str, str]:
+def _launch_camoufox(options: dict[str, Any]):
+    """按优先级尝试启动参数：优先带 geoip（消除 proxy_without_geoip 警告），
+    环境缺 geoip 额外依赖或旧版本不支持该参数时自动回退到不带 geoip 的版本。"""
     from camoufox.sync_api import Camoufox
 
+    variants = [dict(options)]
+    if "geoip" in variants[0]:
+        fallback = dict(options)
+        fallback.pop("geoip", None)
+        variants.append(fallback)
+    last_error: Exception | None = None
+    for variant in variants:
+        try:
+            return Camoufox(**variant)
+        except Exception as exc:  # noqa: BLE001 - 回退到下一个参数组合
+            last_error = exc
+    raise last_error if last_error is not None else RuntimeError("Camoufox 启动失败")
+
+
+def create_session(api_base: str, proxy_value: str = "") -> dict[str, str]:
     options: dict[str, Any] = {"headless": False}
     proxy = _camoufox_proxy(proxy_value)
     if proxy:
         options["proxy"] = proxy
-        # Camoufox 在使用代理时未声明 geoip 会抛 LeakWarning 并中断启动
+        # 使用代理时声明 geoip，避免 camoufox 抛 proxy_without_geoip 警告
         options["geoip"] = True
     hostname = (urlparse(api_base).hostname or "").lower()
 
-    try:
-        browser_factory = Camoufox(**options)
-    except TypeError:
-        options.pop("geoip", None)
-        browser_factory = Camoufox(**options)
+    browser_factory = _launch_camoufox(options)
 
     with browser_factory as browser:
         page = browser.new_page()

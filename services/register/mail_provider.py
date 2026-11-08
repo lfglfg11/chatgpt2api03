@@ -1363,7 +1363,7 @@ def _gptmail2_refresh_browser_session_in_xvfb(api_base: str, conf: dict) -> dict
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("GPTMail2 浏览器验证超时") from exc
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip().replace("\n", " ")[:500]
+        detail = (completed.stderr or completed.stdout or "").strip().replace("\n", " ")[:1500]
         raise RuntimeError(f"GPTMail2 浏览器验证失败: {detail or f'退出码 {completed.returncode}'}")
     try:
         payload = json.loads(completed.stdout)
@@ -1388,16 +1388,26 @@ def _gptmail2_refresh_browser_session(api_base: str, conf: dict, entry: dict | N
     proxy = _gptmail2_camoufox_proxy(str(conf.get("proxy") or ""))
     if proxy:
         options["proxy"] = proxy
-        # Camoufox 在使用代理时未声明 geoip 会抛 LeakWarning 并中断启动
+        # 使用代理时声明 geoip，避免 camoufox 抛 proxy_without_geoip 警告
         options["geoip"] = True
 
     hostname = (urlparse(api_base).hostname or "").lower()
     timeout_ms = max(10_000, int(float(conf.get("request_timeout") or 30) * 1000))
-    try:
-        browser_factory = Camoufox(**options)
-    except TypeError:
-        options.pop("geoip", None)
-        browser_factory = Camoufox(**options)
+    variants = [dict(options)]
+    if "geoip" in variants[0]:
+        fallback_options = dict(options)
+        fallback_options.pop("geoip", None)
+        variants.append(fallback_options)
+    browser_factory = None
+    last_error: Exception | None = None
+    for variant in variants:
+        try:
+            browser_factory = Camoufox(**variant)
+            break
+        except Exception as exc:  # noqa: BLE001 - 回退到下一个参数组合
+            last_error = exc
+    if browser_factory is None:
+        raise RuntimeError(f"Camoufox 启动失败: {last_error}")
     with browser_factory as browser:
         page = browser.new_page()
         page.goto(f"{api_base}/zh/", wait_until="domcontentloaded", timeout=max(timeout_ms, 60_000))
